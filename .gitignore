@@ -1,0 +1,11 @@
+dev/
+dev-answer/
+out/
+build/
+generator/
+bench*/
+*.o
+*.exe
+shopping_sessions
+__pycache__/
+.pytest_cache/

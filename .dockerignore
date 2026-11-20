@@ -1,0 +1,11 @@
+dev/
+dev-answer/
+out/
+build/
+generator/
+bench*/
+fixtures/
+*.o
+*.exe
+shopping_sessions
+.git/
