@@ -1,105 +1,254 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <optional>
-#include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 #include "csv_parse.hpp"
 #include "hash_util.hpp"
 #include "io_util.hpp"
+#include "thread_pool.hpp"
 
 class LinkTable {
    public:
+    static constexpr size_t kShards = 32;
+
+    struct LinkSlot {
+        CompactStr key;
+        uint32_t val;
+    };
+    static_assert(sizeof(LinkSlot) == 16);
+
+    struct SubTable {
+        std::vector<LinkSlot> slots;
+        size_t mask = 0;
+        size_t count = 0;
+    };
+
     struct NodeSlice {
         uint32_t off;
         uint32_t len;
     };
 
-    void build(const std::string& links_dir, size_t ncpu) {
-        auto files = map_all_csvs(links_dir);
-        auto slices = build_slices(files);
-        if (slices.empty()) return;
+    void build(const std::string& links_dir, ThreadPool& pool) {
+        auto files = open_all_csvs(links_dir);
+        auto chunks = build_pread_chunks(files);
+        if (chunks.empty()) return;
 
-        struct RawPair {
-            uint32_t off_a, len_a;
-            uint32_t off_b, len_b;
+        const size_t ncpu = pool.size();
+
+        struct RawEdge {
+            CompactStr a;
+            CompactStr b;
+            uint64_t ha;
+            uint64_t hb;
         };
-        struct ThreadBuf {
-            OverflowArena arena;
-            std::vector<RawPair> pairs;
+        struct StrItem {
+            CompactStr s;
+            uint64_t h;
         };
 
-        const size_t nthreads = std::min(std::max<size_t>(1, ncpu), slices.size());
-        std::vector<ThreadBuf> tbufs(nthreads);
-        std::atomic<size_t> next_slice{0};
+        std::vector<OverflowArena> tmp_arenas(ncpu);
+        std::vector<ChunkedVec<RawEdge>> raw_edges(ncpu);
+        std::vector<std::vector<ChunkedVec<StrItem>>> str_buckets(ncpu);
+        for (size_t t = 0; t < ncpu; ++t) str_buckets[t].resize(kShards);
 
-        auto worker = [&](size_t tid) {
-            auto& tb = tbufs[tid];
-            std::string_view f[2];
-            for (;;) {
-                const size_t si = next_slice.fetch_add(1, std::memory_order_relaxed);
-                if (si >= slices.size()) break;
-                const FileSlice& s = slices[si];
-                const char* p = s.base + s.start;
-                const char* end = s.base + s.end;
-                while (p < end) {
-                    const char* nl =
-                        static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
-                    const char* lend = nl ? nl : end;
-                    const size_t len = static_cast<size_t>(lend - p);
-                    if (split_csv_line<2>(p, len, f) && !f[0].empty() && !f[1].empty()) {
-                        const uint32_t oa = tb.arena.push(f[0]);
-                        const uint32_t ob = tb.arena.push(f[1]);
-                        tb.pairs.push_back(RawPair{oa, static_cast<uint32_t>(f[0].size()), ob,
-                                                   static_cast<uint32_t>(f[1].size())});
-                    }
-                    p = nl ? (nl + 1) : end;
+        {
+            std::atomic<size_t> next_chunk{0};
+            pool.run([&](size_t tid) {
+                std::vector<char> buf;
+                buf.reserve((size_t(2) << 20) + 65536 + 64);
+                auto& arena = tmp_arenas[tid];
+                auto& edges = raw_edges[tid];
+                auto& sbuckets = str_buckets[tid];
+                const uint16_t aid = static_cast<uint16_t>(tid);
+
+                for (;;) {
+                    const size_t ci = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                    if (ci >= chunks.size()) break;
+                    size_t data_start = 0, limit = 0, blen = 0;
+                    read_chunk_into(chunks[ci], buf, data_start, limit, blen);
+                    if (data_start >= limit) continue;
+
+                    for_each_csv_line<2>(
+                        buf.data(), data_start, limit, blen, [&](const std::string_view (&f)[2]) {
+                            if (f[0].empty() || f[1].empty()) return;
+                            uint64_t ha = wyhash64(f[0]);
+                            uint64_t hb = wyhash64(f[1]);
+                            if (ha == 0) ha = 1;
+                            if (hb == 0) hb = 1;
+                            const CompactStr ca = CompactStr::make_str(f[0], aid, arena);
+                            const CompactStr cb = CompactStr::make_str(f[1], aid, arena);
+                            edges.push_back(RawEdge{ca, cb, ha, hb});
+                            sbuckets[static_cast<size_t>(ha >> 59)].push_back(StrItem{ca, ha});
+                            sbuckets[static_cast<size_t>(hb >> 59)].push_back(StrItem{cb, hb});
+                        });
                 }
-            }
-        };
-
-        if (nthreads == 1) {
-            worker(0);
-        } else {
-            std::vector<std::thread> threads;
-            threads.reserve(nthreads);
-            for (size_t t = 0; t < nthreads; ++t) {
-                threads.emplace_back(worker, t);
-            }
-            for (auto& th : threads) th.join();
+            });
         }
         files.clear();
 
-        size_t total_pairs = 0;
-        for (const auto& tb : tbufs) total_pairs += tb.pairs.size();
-        if (total_pairs == 0) return;
+        size_t total_edges = 0;
+        for (const auto& re : raw_edges) total_edges += re.size();
+        if (total_edges == 0) return;
 
-        id_map_.reserve(total_pairs * 2);
-        nodes_.reserve(total_pairs);
-        std::vector<uint32_t> parent;
-        std::vector<uint8_t> rank;
-        std::vector<uint32_t> min_node;
-        parent.reserve(total_pairs);
-        rank.reserve(total_pairs);
-        min_node.reserve(total_pairs);
-
-        auto intern = [&](std::string_view sv) -> uint32_t {
-            const uint32_t next_id = static_cast<uint32_t>(nodes_.size());
-            auto [val_ptr, inserted] = id_map_.emplace(sv, next_id);
-            if (!inserted) return *val_ptr;
-            const uint32_t off = node_arena_.push(sv);
-            nodes_.push_back(NodeSlice{off, static_cast<uint32_t>(sv.size())});
-            parent.push_back(next_id);
-            rank.push_back(0);
-            min_node.push_back(next_id);
-            return next_id;
+        // Build per-shard LinkSlot hash tables + local unique strings in parallel
+        struct ShardUniq {
+            std::vector<uint64_t> hashes;
         };
+        std::vector<ShardUniq> shard_uniqs(kShards);
+        node_arenas_.resize(kShards);
+        sub_tables_.resize(kShards);
 
+        {
+            std::atomic<size_t> next_b{0};
+            pool.run([&](size_t) {
+                const OverflowArena* tmp_ptr = tmp_arenas.data();
+                const OverflowArena* node_ptr = node_arenas_.data();
+                for (;;) {
+                    const size_t b = next_b.fetch_add(1, std::memory_order_relaxed);
+                    if (b >= kShards) break;
+
+                    size_t raw_cnt = 0;
+                    for (size_t t = 0; t < ncpu; ++t) raw_cnt += str_buckets[t][b].size();
+                    if (raw_cnt == 0) continue;
+
+                    size_t cap = 64;
+                    while (cap * 11 < raw_cnt * 15) cap <<= 1;
+                    auto& st = sub_tables_[b];
+                    st.slots.assign(cap, LinkSlot{});
+                    st.mask = cap - 1;
+                    st.count = 0;
+
+                    auto& su = shard_uniqs[b];
+                    auto& b_arena = node_arenas_[b];
+                    const uint16_t b_aid = static_cast<uint16_t>(b);
+
+                    auto rehash_st = [&]() {
+                        const size_t ncap = st.slots.size() * 2;
+                        std::vector<LinkSlot> nxt(ncap);
+                        const size_t nmask = ncap - 1;
+                        for (const auto& sl : st.slots) {
+                            if (sl.key.empty_sentinel()) continue;
+                            const uint64_t h = su.hashes[sl.val];
+                            size_t idx = static_cast<size_t>(h) & nmask;
+                            while (!nxt[idx].key.empty_sentinel()) idx = (idx + 1) & nmask;
+                            nxt[idx] = sl;
+                        }
+                        st.slots.swap(nxt);
+                        st.mask = nmask;
+                    };
+
+                    for (size_t t = 0; t < ncpu; ++t) {
+                        str_buckets[t][b].for_each_block([&](const StrItem* ptr, size_t n) {
+                            for (size_t i = 0; i < n; ++i) {
+                                const StrItem& it = ptr[i];
+                                if ((st.count + 1) * 10 >= st.slots.size() * 6) rehash_st();
+                                size_t idx = static_cast<size_t>(it.h) & st.mask;
+                                for (;;) {
+                                    LinkSlot& sl = st.slots[idx];
+                                    if (sl.key.empty_sentinel()) {
+                                        const uint32_t local_id =
+                                            static_cast<uint32_t>(su.hashes.size());
+                                        std::string_view sv = it.s.raw_view(tmp_ptr);
+                                        if (sv.size() <= 11) {
+                                            sl.key = it.s;
+                                        } else {
+                                            const uint32_t off = b_arena.push(sv);
+                                            sl.key = CompactStr::make_overflow(
+                                                off, static_cast<uint32_t>(sv.size()), b_aid);
+                                        }
+                                        sl.val = local_id;
+                                        su.hashes.push_back(it.h);
+                                        ++st.count;
+                                        break;
+                                    }
+                                    if (CompactStr::equals_cross(sl.key, node_ptr, it.s, tmp_ptr)) {
+                                        break;
+                                    }
+                                    idx = (idx + 1) & st.mask;
+                                }
+                            }
+                        });
+                        str_buckets[t][b].clear_and_free();
+                    }
+                }
+            });
+        }
+        std::vector<std::vector<ChunkedVec<StrItem>>>().swap(str_buckets);
+
+        std::vector<uint32_t> shard_base(kShards + 1, 0);
+        for (size_t b = 0; b < kShards; ++b) {
+            shard_base[b + 1] = shard_base[b] + static_cast<uint32_t>(shard_uniqs[b].hashes.size());
+        }
+        const uint32_t num_nodes = shard_base[kShards];
+        nodes_.resize(num_nodes);
+        node_hash_.resize(num_nodes);
+
+        // Flatten node metadata, offset sub_table slot values to global node IDs, and convert RawEdges to (u, v)
+        struct EdgePair {
+            uint32_t a;
+            uint32_t b;
+        };
+        std::vector<std::vector<EdgePair>> resolved_edges(ncpu);
+        {
+            std::atomic<size_t> next_b{0};
+            pool.run([&](size_t) {
+                for (;;) {
+                    const size_t b = next_b.fetch_add(1, std::memory_order_relaxed);
+                    if (b >= kShards) break;
+                    const uint32_t base = shard_base[b];
+                    auto& st = sub_tables_[b];
+                    const auto& su = shard_uniqs[b];
+                    const size_t n = su.hashes.size();
+                    for (size_t i = 0; i < n; ++i) {
+                        nodes_[base + i] = CompactStr{};  // filled below
+                        node_hash_[base + i] = su.hashes[i];
+                    }
+                    for (auto& sl : st.slots) {
+                        if (!sl.key.empty_sentinel()) {
+                            const uint32_t gid = base + sl.val;
+                            sl.val = gid;
+                            nodes_[gid] = sl.key;
+                        }
+                    }
+                }
+            });
+        }
+        // Now resolve RawEdges in parallel across ncpu threads (read-only on sub_tables_)
+        {
+            const OverflowArena* tmp_ptr = tmp_arenas.data();
+            const OverflowArena* node_ptr = node_arenas_.data();
+            pool.run([&](size_t tid) {
+                resolved_edges[tid].reserve(raw_edges[tid].size());
+                raw_edges[tid].for_each_block([&](const RawEdge* ptr, size_t n) {
+                    for (size_t i = 0; i < n; ++i) {
+                        const RawEdge& e = ptr[i];
+                        uint32_t ia = 0, ib = 0;
+                        lookup_cross_raw(e.a, e.ha, tmp_ptr, node_ptr, ia);
+                        lookup_cross_raw(e.b, e.hb, tmp_ptr, node_ptr, ib);
+                        resolved_edges[tid].push_back(EdgePair{ia, ib});
+                    }
+                });
+                raw_edges[tid].clear_and_free();
+                tmp_arenas[tid].free_all();
+            });
+        }
+        std::vector<ChunkedVec<RawEdge>>().swap(raw_edges);
+        std::vector<OverflowArena>().swap(tmp_arenas);
+        std::vector<ShardUniq>().swap(shard_uniqs);
+
+        // Fast integer Union-Find
+        std::vector<uint32_t> parent(num_nodes);
+        std::vector<uint8_t> rank(num_nodes, 0);
+        std::vector<uint32_t> min_node(num_nodes);
+        for (uint32_t i = 0; i < num_nodes; ++i) {
+            parent[i] = i;
+            min_node[i] = i;
+        }
         auto find = [&](uint32_t x) -> uint32_t {
             uint32_t r = x;
             while (parent[r] != r) r = parent[r];
@@ -110,13 +259,10 @@ class LinkTable {
             }
             return r;
         };
-
-        for (auto& tb : tbufs) {
-            for (const RawPair& rp : tb.pairs) {
-                const uint32_t a = intern(tb.arena.get(rp.off_a, rp.len_a));
-                const uint32_t b = intern(tb.arena.get(rp.off_b, rp.len_b));
-                uint32_t ra = find(a);
-                uint32_t rb = find(b);
+        for (auto& vec : resolved_edges) {
+            for (const EdgePair& ep : vec) {
+                uint32_t ra = find(ep.a);
+                uint32_t rb = find(ep.b);
                 if (ra == rb) continue;
                 const uint32_t mn =
                     byte_less(node_sv(min_node[ra]), node_sv(min_node[rb])) ? min_node[ra]
@@ -126,31 +272,80 @@ class LinkTable {
                 if (rank[ra] == rank[rb]) ++rank[ra];
                 min_node[ra] = mn;
             }
-            tb.arena.free_all();
-            std::vector<RawPair>().swap(tb.pairs);
+            std::vector<EdgePair>().swap(vec);
+        }
+        std::vector<std::vector<EdgePair>>().swap(resolved_edges);
+
+        std::vector<uint32_t> canonical_id(num_nodes);
+        for (uint32_t i = 0; i < num_nodes; ++i) {
+            canonical_id[i] = min_node[find(i)];
         }
 
-        const size_t n = nodes_.size();
-        canonical_id_.resize(n);
-        node_hash_.resize(n);
-        for (size_t i = 0; i < n; ++i) {
-            canonical_id_[i] = min_node[find(static_cast<uint32_t>(i))];
-            node_hash_[i] = wyhash64(node_sv(static_cast<uint32_t>(i)));
+        // Update sub_tables_ values directly to canonical_id in parallel
+        {
+            std::atomic<size_t> next_b{0};
+            pool.run([&](size_t) {
+                for (;;) {
+                    const size_t b = next_b.fetch_add(1, std::memory_order_relaxed);
+                    if (b >= kShards) break;
+                    for (auto& sl : sub_tables_[b].slots) {
+                        if (!sl.key.empty_sentinel()) {
+                            sl.val = canonical_id[sl.val];
+                        }
+                    }
+                }
+            });
         }
     }
 
-    bool empty() const noexcept { return id_map_.empty(); }
+    bool empty() const noexcept { return nodes_.empty(); }
 
-    std::optional<uint32_t> resolve_user(std::string_view sv) const noexcept {
-        if (id_map_.empty()) return std::nullopt;
-        const uint32_t* id = id_map_.find(sv);
-        if (!id) return std::nullopt;
-        return canonical_id_[*id];
+    void prefetch(uint64_t h) const noexcept {
+        if (nodes_.empty()) return;
+        const SubTable& st = sub_tables_[static_cast<size_t>(h >> 59)];
+        if (!st.slots.empty()) {
+            __builtin_prefetch(&st.slots[static_cast<size_t>(h) & st.mask], 0, 1);
+        }
+    }
+
+    bool resolve_with_hash(const CompactStr& key, uint64_t h, uint32_t& out_canon_id,
+                           const OverflowArena* key_arenas) const noexcept {
+        if (nodes_.empty()) return false;
+        const SubTable& st = sub_tables_[static_cast<size_t>(h >> 59)];
+        if (st.slots.empty()) return false;
+        const OverflowArena* node_ptr = node_arenas_.data();
+        size_t idx = static_cast<size_t>(h) & st.mask;
+        for (;;) {
+            const LinkSlot& sl = st.slots[idx];
+            if (sl.key.empty_sentinel()) return false;
+            if (CompactStr::equals_cross(sl.key, node_ptr, key, key_arenas)) {
+                out_canon_id = sl.val;
+                return true;
+            }
+            idx = (idx + 1) & st.mask;
+        }
+    }
+
+    bool resolve_sv_with_hash(std::string_view sv, uint64_t h,
+                              uint32_t& out_canon_id) const noexcept {
+        if (nodes_.empty()) return false;
+        const SubTable& st = sub_tables_[static_cast<size_t>(h >> 59)];
+        if (st.slots.empty()) return false;
+        const OverflowArena* node_ptr = node_arenas_.data();
+        size_t idx = static_cast<size_t>(h) & st.mask;
+        for (;;) {
+            const LinkSlot& sl = st.slots[idx];
+            if (sl.key.empty_sentinel()) return false;
+            if (CompactStr::equals_sv(sl.key, node_ptr, sv)) {
+                out_canon_id = sl.val;
+                return true;
+            }
+            idx = (idx + 1) & st.mask;
+        }
     }
 
     std::string_view node_sv(uint32_t node_id) const noexcept {
-        const NodeSlice& ns = nodes_[node_id];
-        return node_arena_.get(ns.off, ns.len);
+        return nodes_[node_id].raw_view(node_arenas_.data());
     }
 
     uint64_t canonical_hash(uint32_t canon_node_id) const noexcept {
@@ -158,9 +353,22 @@ class LinkTable {
     }
 
    private:
-    OverflowArena node_arena_;
-    std::vector<NodeSlice> nodes_;
-    FlatStrMap<uint32_t> id_map_;
-    std::vector<uint32_t> canonical_id_;
+    void lookup_cross_raw(const CompactStr& key, uint64_t h, const OverflowArena* key_arenas,
+                          const OverflowArena* node_ptr, uint32_t& out_gid) const noexcept {
+        const SubTable& st = sub_tables_[static_cast<size_t>(h >> 59)];
+        size_t idx = static_cast<size_t>(h) & st.mask;
+        for (;;) {
+            const LinkSlot& sl = st.slots[idx];
+            if (CompactStr::equals_cross(sl.key, node_ptr, key, key_arenas)) {
+                out_gid = sl.val;
+                return;
+            }
+            idx = (idx + 1) & st.mask;
+        }
+    }
+
+    std::vector<OverflowArena> node_arenas_;
+    std::vector<SubTable> sub_tables_;
+    std::vector<CompactStr> nodes_;
     std::vector<uint64_t> node_hash_;
 };

@@ -88,7 +88,7 @@ inline bool byte_less(std::string_view a, std::string_view b) noexcept {
 }
 
 struct OverflowArena {
-    static constexpr size_t BLOCK_SHIFT = 22;  // 4 MB blocks
+    static constexpr size_t BLOCK_SHIFT = 20;  // 1 MB blocks
     static constexpr size_t BLOCK_SIZE = size_t(1) << BLOCK_SHIFT;
     static constexpr size_t BLOCK_MASK = BLOCK_SIZE - 1;
 
@@ -117,7 +117,7 @@ struct OverflowArena {
         for (char* b : blocks) {
             delete[] b;
         }
-        blocks.clear();
+        std::vector<char*>().swap(blocks);
         pos = BLOCK_SIZE;
     }
 
@@ -190,6 +190,7 @@ struct alignas(4) CompactStr {
     }
 
     uint8_t tag() const noexcept { return d[11]; }
+    bool empty_sentinel() const noexcept { return d[11] == 0; }
     bool is_linked() const noexcept { return d[11] == 0xFE; }
     bool is_overflow() const noexcept { return d[11] == 0xFF; }
     bool is_inline() const noexcept { return d[11] <= 11; }
@@ -227,7 +228,7 @@ struct alignas(4) CompactStr {
         std::memcpy(&b2, b.d + 8, 4);
         if (a0 == b0 && a1 == b1 && a2 == b2) return true;
         if (a.d[11] != b.d[11] || a.d[11] != 0xFF) return false;
-        if (a1 != b1) return false;  // length mismatch
+        if (a1 != b1) return false;
         uint32_t a_off, b_off;
         uint16_t a_aid, b_aid;
         a.overflow_info(a_off, a1, a_aid);
@@ -237,6 +238,36 @@ struct alignas(4) CompactStr {
         const char* pb = arenas[b_aid].blocks[b_off >> OverflowArena::BLOCK_SHIFT] +
                          (b_off & OverflowArena::BLOCK_MASK);
         return std::memcmp(pa, pb, a1) == 0;
+    }
+
+    static bool equals_cross(const CompactStr& a, const OverflowArena* arenas_a,
+                             const CompactStr& b, const OverflowArena* arenas_b) noexcept {
+        if (a.d[11] != b.d[11]) return false;
+        if (a.d[11] <= 11 || a.d[11] == 0xFE) {
+            uint32_t a0, a1, a2, b0, b1, b2;
+            std::memcpy(&a0, a.d, 4);
+            std::memcpy(&a1, a.d + 4, 4);
+            std::memcpy(&a2, a.d + 8, 4);
+            std::memcpy(&b0, b.d, 4);
+            std::memcpy(&b1, b.d + 4, 4);
+            std::memcpy(&b2, b.d + 8, 4);
+            return a0 == b0 && a1 == b1 && a2 == b2;
+        }
+        std::string_view sa = a.raw_view(arenas_a);
+        std::string_view sb = b.raw_view(arenas_b);
+        return sa.size() == sb.size() &&
+               (sa.empty() || std::memcmp(sa.data(), sb.data(), sa.size()) == 0);
+    }
+
+    static bool equals_sv(const CompactStr& a, const OverflowArena* arenas_a,
+                          std::string_view sv) noexcept {
+        if (sv.size() <= 11) {
+            if (a.d[11] != sv.size()) return false;
+            return sv.empty() || std::memcmp(a.d, sv.data(), sv.size()) == 0;
+        }
+        if (a.d[11] != 0xFF) return false;
+        std::string_view sa = a.raw_view(arenas_a);
+        return sa.size() == sv.size() && std::memcmp(sa.data(), sv.data(), sv.size()) == 0;
     }
 };
 static_assert(sizeof(CompactStr) == 12);
@@ -342,7 +373,7 @@ class FlatStrMap {
     size_t count_ = 0;
 };
 
-template <typename T, size_t BlockCap = 2048>
+template <typename T, size_t BlockCap = ((65536u / sizeof(T)) >= 256u ? (65536u / sizeof(T)) : 256u)>
 class ChunkedVec {
     static_assert(std::is_trivially_copyable_v<T>);
     static_assert(std::is_trivially_destructible_v<T>);

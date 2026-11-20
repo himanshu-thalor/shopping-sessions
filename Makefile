@@ -11,7 +11,7 @@ export IMAGE CPUS MEM PLATFORM
 
 native:
 	mkdir -p build
-	g++ -O3 -std=c++20 -march=x86-64-v3 -mtune=cascadelake -flto -DNDEBUG -Wall -Wextra -Werror -pthread src/main.cpp -o build/shopping_sessions
+	g++ -O3 -std=c++20 -march=x86-64-v3 -mtune=cascadelake -flto=auto -DNDEBUG -Wall -Wextra -Werror -pthread src/main.cpp -o build/shopping_sessions
 
 build:
 	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
