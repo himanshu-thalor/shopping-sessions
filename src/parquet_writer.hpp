@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "hash_util.hpp"
+
 namespace parquet_detail {
 
 class Buf {
@@ -107,7 +109,7 @@ class FastByteCursor {
     const uint8_t* data() const noexcept { return buf_.data(); }
     size_t size() const noexcept { return static_cast<size_t>(cur_ - buf_.data()); }
 
-    void write_len_str(std::string_view sv) {
+    [[gnu::always_inline]] inline void write_len_str(std::string_view sv) {
         const uint32_t slen = static_cast<uint32_t>(sv.size());
         const size_t need = 4 + slen;
         if (__builtin_expect(static_cast<size_t>(end_ - cur_) < need, 0)) {
@@ -116,6 +118,23 @@ class FastByteCursor {
         std::memcpy(cur_, &slen, 4);
         if (slen > 0) std::memcpy(cur_ + 4, sv.data(), slen);
         cur_ += need;
+    }
+
+    [[gnu::always_inline]] inline void write_fast_id64(FastId64<'u'> id,
+                                                       const OverflowArena* const* arenas) {
+        if (__builtin_expect(id.is_inline(), 1)) {
+            if (__builtin_expect(static_cast<size_t>(end_ - cur_) < 16, 0)) {
+                grow(16);
+            }
+            const uint32_t slen = id.inline_len();
+            std::memcpy(cur_, &slen, 4);
+            cur_[4] = 'u';
+            std::memcpy(cur_ + 5, &id.raw, 8);
+            cur_ += 4 + slen;
+        } else {
+            char scratch[9];
+            write_len_str(id.view(arenas, scratch));
+        }
     }
 
    private:
@@ -374,9 +393,12 @@ class UserDailyParquetWriter {
           col_revenue_(kRowGroupRows),
           def_top_cat_(kRowGroupRows) {}
 
-    void add_row(std::string_view user_id, int32_t day, int32_t sessions, int32_t events,
-                 int64_t revenue_cents, bool has_top_cat, std::string_view top_cat) {
-        col_user_.write_len_str(user_id);
+    [[gnu::always_inline]] inline void add_row(FastId64<'u'> user_id,
+                                               const OverflowArena* const* arenas, int32_t day,
+                                               int32_t sessions, int32_t events,
+                                               int64_t revenue_cents, bool has_top_cat,
+                                               std::string_view top_cat) {
+        col_user_.write_fast_id64(user_id, arenas);
 
         const size_t i = static_cast<size_t>(rg_rows_);
         col_day_[i] = day;
@@ -391,7 +413,7 @@ class UserDailyParquetWriter {
 
         ++rg_rows_;
         ++total_rows_;
-        if (rg_rows_ >= kRowGroupRows) {
+        if (__builtin_expect(rg_rows_ >= kRowGroupRows, 0)) {
             flush_row_group();
         }
     }
@@ -436,10 +458,19 @@ class UserDailyParquetWriter {
         emit_raw(1, "events", false, col_events_.data(), nrows * 4);
         emit_raw(2, "revenue_cents", false, col_revenue_.data(), nrows * 8);
 
-        body_top_cat_.clear();
-        parquet_detail::encode_def_levels_bit1(body_top_cat_, def_top_cat_.data(), nrows);
-        body_top_cat_.bytes(vals_top_cat_.data(), vals_top_cat_.size());
-        emit_raw(6, "top_category", true, body_top_cat_.data.data(), body_top_cat_.size());
+        def_buf_.clear();
+        parquet_detail::encode_def_levels_bit1(def_buf_, def_top_cat_.data(), nrows);
+        const size_t top_body_len = def_buf_.size() + vals_top_cat_.size();
+        parquet_detail::write_page_header(hdr_tmp_, static_cast<int32_t>(top_body_len),
+                                          static_cast<int32_t>(rg_rows_));
+        const int64_t top_off = file_.offset();
+        file_.write_raw(hdr_tmp_.data.data(), hdr_tmp_.size());
+        file_.write_raw(def_buf_.data.data(), def_buf_.size());
+        file_.write_raw(vals_top_cat_.data(), vals_top_cat_.size());
+        const int64_t top_tot = static_cast<int64_t>(hdr_tmp_.size() + top_body_len);
+        rg.total_byte_size += top_tot;
+        rg.cols.push_back(
+            parquet_detail::ChunkMeta{6, "top_category", true, rg_rows_, top_tot, top_off});
 
         rgs_.push_back(std::move(rg));
         col_user_.clear();
@@ -452,7 +483,7 @@ class UserDailyParquetWriter {
     std::vector<int32_t> col_day_, col_sessions_, col_events_;
     std::vector<int64_t> col_revenue_;
     std::vector<uint8_t> def_top_cat_;
-    parquet_detail::Buf body_top_cat_, hdr_tmp_;
+    parquet_detail::Buf def_buf_, hdr_tmp_;
     std::vector<parquet_detail::RowGroupRecord> rgs_;
     int64_t rg_rows_ = 0;
     int64_t total_rows_ = 0;

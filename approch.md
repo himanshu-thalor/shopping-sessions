@@ -1,188 +1,91 @@
-# Shopping Sessions — Engineering Approach, Architecture & Optimization Notes
+# Shopping Sessions — High-Performance C++20 Architecture & Optimization Log (`prompt-gods`)
 
-> Written for peer/review agents to understand the full problem specification, every invariant/edge case, the C++20 implementation under `src/`, our measured benchmark progression, and the remaining optimization headroom.
-
----
-
-## 1. Track Summary & Scorer Environment
-
-- **Track:** Databricks — Shopping Sessions (`shopping-sessions-4`)
-- **Goal:** Transform messy e-commerce clickstream CSVs (`events/*.csv`, `clicks/*.csv`, `links/*.csv`) + lookup tables (`products.csv`, `campaigns.csv`, `manifest.json`) into two exact Parquet tables: `/output/user_daily/` and `/output/campaign_daily/`.
-- **Scoring:** Lowest container start-to-exit wall-clock time among **100% exact** solutions.
-  - Practice: ~20M events (`5M` clicks), median of 3 if `< 20 s`. Current `#1` on leaderboard: `2.74 s` (starter PySpark baseline: `171.91 s`).
-  - Final: ~60M events (~`15M` clicks), median of 3 (top 5 re-timed 5× on an isolated machine), 180 s cap.
-- **Container / Hardware Constraints:**
-  - `linux/amd64` Docker image, Google Cloud `n2` Intel Xeon Cascade Lake+ (`AVX-512` available), `8` vCPUs (`NCPU=8`, hyperthreads), `24 GB` RAM (no swap), read-only rootfs except `/tmp` (`64 MB` tmpfs), `uid 1000`, no network, `/data` read-only, `/output` & `/scratch` writable (`<= 50 GB`).
-  - Repo limit `<= 50 MB`, Docker image `<= 8 GB`, stdout `<= 50 MB` (all diagnostics go to `stderr`).
+## 1. Scorer Environment & Constraints
+- **Target Hardware:** Google Cloud `n2` Intel Xeon Cascade Lake+ (`linux/amd64`, `AVX-512BW` + `AVX-512VL` + `BMI2` `_pext_u64`), `NCPU=8`, `MEM_GB=24`.
+- **Container & Sandbox:** `debian:bookworm-slim` (built from `gcc:13-bookworm`), `--network none`, `--read-only`, `--tmpfs /tmp:rw,size=64m`, `--user 1000:1000`, `/data` read-only, `/output` writable.
+- **Scale:** Practice ~20M events / 5M clicks; Final ~60M events / 15M clicks (180 s cap).
+- **Correctness Requirement:** 100% bit-exact match across all 36 edge-case fixtures (`A1`–`J4`), 1M `dev/`, and 20M `d20m` in both `FastPack=true` and `FastPack=false` (`SS_FORCE_SLOW_PACK=1`) modes.
 
 ---
 
-## 2. Exact Rules & Critical Edge Cases (Per `rules.md` & 36 Fixtures)
-
-1. **CSV Dialect (`src/csv_parse.hpp`):**
-   - Only `\n` terminates a line; `\r` is an ordinary character inside fields (e.g., `1000\r` fails purchase price validation; `...Z\r` fails timestamp parsing).
-   - Whole-field double quotes (`"u1"` -> `u1`, `""` -> null/empty); any embedded or unbalanced quote (`a"b`, `u5"`, `"a""b"`), wrong field count, or empty line is malformed and dropped.
-   - Leading/trailing spaces are significant (` u1` != `u1 ` != `u1`), and strings are strictly case-sensitive (`u1` != `U1`).
-   - All numeric checks accept **ASCII digits `0`–`9` only** (rejecting Unicode digits such as `٢٥٠` or `２５０`).
-   - Line 0 of every CSV in `events/`, `clicks/`, and `links/` is the header; subsequent rows identical to the header (e.g. fixture `L3`) are data rows. Files may be empty, header-only, or lack a trailing `\n`.
-
-2. **Timestamps (`src/csv_parse.hpp`):**
-   - `F1`: `YYYY-MM-DDTHH:MM:SSZ` (20 bytes, uppercase `T`/`Z`).
-   - `F2`: `YYYY-MM-DDTHH:MM:SS±HH:MM` (25 bytes, offset hours `00..23`, minutes `00..59`; `-00:00` is UTC).
-   - `F3`: ASCII digits only (epoch ms, leading zeros allowed; numeric overflow beyond `int64_t` is outside any window).
-   - Strict calendar/leap-year validation (`is_leap_year` handles `2028-02-29` valid vs `2027-02-29`, `2100-02-29`, `02-30`, hour `24`, second `60`).
-   - Windows:
-     - Events: `window_start <= ts < window_end`
-     - Clicks: `window_start - 7 days <= ts < window_end`
-
-3. **Linked IDs (`src/union_find.hpp`):**
-   - Drop malformed lines or lines with either side empty.
-   - Transitive connected components across all `links/*.csv` files (chains up to 400 links long, shared kiosk devices tying thousands of users into one component).
-   - Canonical person name = **unsigned byte-wise minimum** (`std::memcmp`, NEVER signed `char`) among all IDs in the component, **even if that smallest ID never appears in any event or click** (`L2`).
-
-4. **Events Processing Order (`src/main.cpp`):**
-   - Parse -> drop malformed or empty `event_id`.
-   - **Dedup on `event_id` keeping smallest `ingest_ts` BEFORE validation:** if the earliest-ingested copy has an invalid `ts`, invalid `type`, bad `price_cents`, empty `user_id`/`product_id`, or arrives late (`ingest_ts - ts > 24 h`), the whole event is dropped (`E5`)—later copies cannot rescue it.
-   - Validation: `user_id` non-empty, `ts` in event window, `ingest_ts - ts <= 86,400,000 ms` (`ingest_ts < ts` kept), `event_type` in `{view, cart, purchase}`, `product_id` non-empty. `purchase` requires `price_cents` in `1..10,000,000`; `view`/`cart` ignore `price_cents`.
-   - Sessionize per person across all linked IDs sorted by `ts`: new session iff `ts - prev_ts > 1,800,000 ms` (30 min). Equal timestamps share a session (`E16`).
-   - Session day = UTC date of session start (`floor_div_day`); all events/revenue in a midnight-crossing session count on the start day (`E3`).
-   - Categories from `products.csv`; missing products map to `"unknown"` (`E9`). `top_category` per `(person, day)` is highest summed purchase revenue, tie-broken byte-wise (`E8`), `NULL` when `revenue_cents == 0`.
-
-5. **Clicks & Attribution (`src/main.cpp`):**
-   - Parse -> drop malformed or empty `click_id`; keep valid clicks (`user_id` non-empty, `campaign_id` in `campaigns.csv`, `ts` in click window). Note: duplicate valid click rows have identical `(click_id, user_id, campaign_id, ts)` per `rules.md`, so neither latest-click credit nor distinct-campaign assists are altered.
-   - Credit each session to the person's click in `[session_start - 7 days, session_start]` with latest `ts`, tie-broken by unsigned byte-wise smallest `click_id` (`A5`); otherwise `("organic", "organic")`.
-   - Assists: every distinct non-`organic` campaign with at least one valid click in `[session_start - 7 days, session_start]` assists the session once (`A11`, `A12`), including the credited campaign. A campaign with only assists on a day gets a row with `0` in the three credited columns.
-
-6. **Outputs (`src/parquet_writer.hpp`):**
-   - `/output/user_daily/*.parquet`: `(user_id: STRING, day: DATE, sessions: INT32, events: INT32, revenue_cents: INT64, top_category: STRING nullable)`
-   - `/output/campaign_daily/*.parquet`: `(campaign_id: STRING, channel: STRING, day: DATE, sessions: INT32, purchasing_sessions: INT32, revenue_cents: INT64, assisted_sessions: INT32)`
-   - Valid schema-complete Parquet files emitted even on 0-row outputs (`E5`, `E13`).
+## 2. Root-Cause Diagnosis of Baseline Bottlenecks
+1. **Un-inlined SIMD Delimiter & Row Callbacks (`csv_parse.hpp`):**
+   - `csv_simd::delimiters_avx512` lacked matching target attributes on callers, causing ~65M out-of-line function calls and `vzeroupper` penalties.
+   - Passing a single multi-call lambda (`on_row`) to both the hot SIMD path and the cold `split_csv_line` fallback caused GCC `-flto` to emit an out-of-line `call` on every row (27.5M calls at 20M scale) and a stack canary (`__stack_chk_fail`) for `tail_buf[256]`.
+2. **PGO Mis-training (`Dockerfile`):**
+   - The synthetic PGO generator previously emitted short numeric IDs (`e123`, `u456`), mis-training branch predictors away from the generator's real 9-byte base36 scrambled IDs (`e` + 8 base36 chars, `u` + 8 base36 chars, `k` + 8 base36 chars) and 20% whole-field quoting.
+3. **Kernel `exit_mmap()` Teardown & Page Faults (`io_util.hpp`):**
+   - Mapping ~1.86 GB of CSV files via `mmap` faulted ~476,000 4 KB PTEs and incurred `43–48 ms` of single-threaded kernel `_exit(0)` teardown on warm runs and a 4x slowdown on cold runs.
+   - Switching to parallel `256 KB` `pread` chunks with 192-byte zero padding keeps buffers L2-resident (`66.6 GB/s` in microbenchmarks), eliminates EOF `SafeMargin`/`tail_buf[256]` branches, and drops `_exit(0)` teardown overhead from `~47 ms` to `~13.6 ms`.
+4. **Memory Footprint & Cache Misses in Phases 1, A, B, and C:**
+   - Shrinking `FastId64<Prefix>` to 8 bytes (inline `<Prefix><1..8 ASCII bytes>` with `__builtin_clzll` length and `__builtin_bswap64` byte-wise ordering, overflow bit 63 into length-prefixed `OverflowArena`) reduced struct sizes across the entire pipeline:
+     - `RawEvent`: `32 B`
+     - `SurvivingEvent`: `16 B`
+     - `SurvivingClick`: `24 B`
+     - `ShardEvent`: `8 B`
+     - `ShardClick`: `16 B`
+     - `PersonMapSlot`: `16 B`
+   - Per-thread lock-free `ThreadBlockArena` (64 KB blocks backed by 2 MB THP-aligned slabs with zero-fault block recycling between phases) eliminated `std::vector` geometric reallocations.
 
 ---
 
-## 3. Architecture & Implemented Optimizations
+## 3. Pipeline Architecture (Pass 1 + Pass 2)
 
-### High-Level Pipeline Flow
+### Startup & Metadata (`src/main.cpp`, `src/csv_parse.hpp`, `src/io_util.hpp`)
+- Overlaps `load_products()` (`products.csv` -> `fast_prod_by_num` `uint8_t` direct index table for `p<num>` + `FlatStrMap` fallback), `load_campaigns()` (`campaigns.csv` -> `fast_camp_by_num` direct index table for `c_<num>` + `FlatStrMap` fallback), and parallel `open_one_pread_file()` across `events/*.csv` and `clicks/*.csv`.
+- Separate `FastDateLut` tables (`ev_date_lut` covering 24 days and `clk_date_lut` covering 25 days with `hi8 = 1` empty sentinels to prevent 8-byte prefix collisions across month boundaries).
+- `DT_REG` fast path in `list_csv_files()` avoids redundant `stat()` calls.
 
-```
-manifest.json, products.csv, campaigns.csv
-        │
-        ▼
-[Phase 1] links/*.csv ──(pread + SIMD + 32-shard parallel intern + DSU)──► LinkTable
-        │
-        ▼
-[Phase 2] events/*.csv ─(pread + SIMD + DateLut + SWAR F3)─► 512 event_id buckets (RawEvent, with tombstones)
-        │
-        ▼
-[Phase 3] 512 buckets ──(L3 8B DedupIdx + 16-ahead LinkTable prefetch)──► 256 person shards (SurvivingEvent)
-        │
-        ▼
-[Phase 4] clicks/*.csv ─(pread + SIMD + 16-ahead LinkTable prefetch)────► 256 person shards (SurvivingClick)
-        │
-        ▼
-[Phase 5] 256 person shards (LPT descending load order across NCPU workers)
-            ├─ Single-pass event & click CSR grouping (0 second hash probes)
-            ├─ LSD Radix sort (nev > 2048) / std::sort on 8B ShardEvent
-            ├─ Sessionizer + per-day top_category -> user_daily/part-<tid>.parquet
-            └─ O(S + C) sliding-window [l, r) click credit + O(1) active_camps assists
-        │
-        ▼
-[Phase 6] Reduce thread-local campaign_daily flat/hash accumulators ─► campaign_daily/part-0.parquet
-```
+### Phase 1: 64-Shard Parallel `LinkTable` (`src/union_find.hpp`)
+- **Sub-phase 1:** Parallel `256 KB` `pread` + AVX-512/AVX2 2-column CSV scan into 64 hash-partitioned `StrItem` (`16 B`) block slices.
+- **Sub-phase 2:** Parallel 64-shard L2-resident string interning (`InternSlot` `16 B`).
+- **Sub-phase 3:** Wait-free parallel Union-Find (halving path compression, linking larger root to smaller root over 4,096-edge chunks) + parallel atomic `min_node` resolution using `UserId64::less`.
+- **Sub-phase 4:** Prunes identity roots (`c == i`, keeping `816,130` of `1,196,113` nodes at 20M) and populates 64 independent power-of-2 sub-tables (`16.0 MB` `LinkSlot`) and 64 independent 3-bit sub-Blooms (`2.0 MB`) in parallel by shard with **zero atomics/CAS**.
+- Provides 2-stage software-prefetched lookups (`prefetch_bloom` -> `may_contain` -> `prefetch_slot` -> `resolve_with_hash` / `resolve_sv_with_hash`).
 
-### Detailed Design & Optimizations Implemented
+### Phase 2 (Phase A): Parallel Events Scan (`src/main.cpp`, `src/csv_parse.hpp`)
+- Parallel `256 KB` `pread` chunks with 192-byte zero padding scanned via `scan_pread_buf_avx512<7>` / `scan_pread_buf_avx2<7>`.
+- Separate single-call-site `handle_fast` (`__attribute__((always_inline))`) and out-of-line `scan_slow_line` eliminate per-row function calls in the hot loop.
+- Branchless `_pext_u64` quote extraction (`extract_fields_64`), SWAR timestamp parsing (`parse_ts_f1_sec` + `parse_ts_any_with_hint` reusing the `ingest_ts` date prefix for `ts`), and L1-resident per-bucket block pointers (`RawEv* cur[512]`, `endp[512]`).
+- Deduplication key (`event_id`, `ingest_rel_sec`) is recorded for every row with valid `event_id` and `ingest_ts` **before** event validation, preserving exact pre-validation deduplication semantics (`rules.md`).
 
-1. **Zero-Dependency C++20 Binary + Persistent Thread Pool (`src/thread_pool.hpp`):**
-   - Eliminates JVM/Python/Polars/Arrow startup overhead (~50 ms total runtime on 1M events) and avoids 5× thread spawn/join overhead by keeping `NCPU - 1` persistent workers parked on a generation counter.
-   - Multi-stage `Dockerfile`: `gcc:13-bookworm` -> `debian:bookworm-slim` with `-static-libstdc++ -static-libgcc`, running as `uid 1000`.
-   - Compiled with baseline `-march=x86-64-v3 -mtune=cascadelake` + runtime `__builtin_cpu_supports("avx512bw")` dispatch so AVX-512BW runs on Google Cloud Cascade Lake scorers and AVX2 runs on local machines without `SIGILL`.
+### Phase B: Overlapped Deduplication + Clicks Scan (`src/main.cpp`)
+- Dedicated click starter threads scan `clicks/*.csv` (`scan_pread_buf_avx512<4>` / `scan_pread_buf_avx2<4>`) with 32-item batched 2-stage Bloom + `LinkTable` prefetching while remaining threads drain `dedup_buckets`.
+- Each dedup bucket uses a compact `DedupIdx` (`8 B`: `idx_plus1`, `hash32`) table at 65% max load (`1.0 MB` per bucket at 20M, L2-resident) with 16-ahead software prefetching, followed by 32-item batched 2-stage Bloom + `LinkTable` resolution and scatter into `person_shards` (`SurvivingEvent` `16 B`), immediately recycling `RawEvent` 64 KB blocks back to `ThreadBlockArena`.
 
-2. **Chunked `pread()` + `POSIX_FADV_SEQUENTIAL` I/O (`src/io_util.hpp`):**
-   - Replaced `mmap()` across 100+ CSVs (which caused `510,909` minor page faults and kernel `mmap_lock` contention across 8 threads) with 2 MB `\n`-bounded `pread()` chunks into one reusable buffer per worker thread (+64 zero padding bytes at EOF for safe SIMD loads).
-   - Eliminated page-fault contention and cut system CPU time and minor page faults (`510k -> 355k`).
+### Phase C: LPT Person Shards, Branchless Sorting Networks & Attribution (`src/main.cpp`, `src/sort_u64.hpp`)
+- Shards are scheduled in Longest-Processing-Time (LPT) descending order.
+- Per-person counting sort groups events and clicks into contiguous per-person slices.
+- **`sort_u64_hi31` (`src/sort_u64.hpp`):**
+  - `n <= 16`: Compile-time unrolled branchless Bose-Nelson sorting networks (`cswap_u64` -> `cmp` + `cmov`).
+  - `17 <= n <= 32`: `bn_sort<0, 16>` + `sort_u64_le16` + branchless 2-way merge.
+  - `33 <= n <= 255`: Branchless Edelkamp-Weiss BlockQuicksort (`16`-element offset buffers) with sorting network base cases.
+  - `n >= 256`: Single-scan histogram + 3-pass (`11/11/9`-bit) LSD radix sort on 31-bit relative timestamps with uniform-bucket pass skipping.
+- **Sessionization & `user_daily`:** Handles event 0 outside the loop; tracks UTC day transitions via relative millisecond thresholds (`next_day_rel += 86400000LL`) with zero 64-bit divisions in `FastPack`; writes `user_daily/part-<tid>.parquet` directly via `FastByteCursor::write_fast_id64` and zero-copy category slices (`src/parquet_writer.hpp`).
+- **Click Attribution & Assisted Sessions:**
+  - Packs per-person clicks (`FastPack && nclk <= 65535 && num_camps <= 65535`) into 8-byte `uint64_t` keys `(ts_rel << 32) | (camp_id << 16) | idx`, sorting via `sort_u64_hi31` and only invoking `ClickId64::less` on equal-timestamp runs.
+  - For `nclk <= 16` (87.7% of clicking persons), maintains active campaigns in a 16-entry L1 stack array (`SmallAct act[16]`); for `nclk > 16`, uses a packed 8-byte `CampState` (`count`, `enter_s`, `active_pos`) vector.
+  - Accumulates assisted sessions in `O(1)` per click via day-level interval differencing (`K - enter_s`) into transposed thread-local tables `[day_idx * num_camps + camp_id]`.
 
-3. **Single-Pass Runtime-Dispatched AVX-512BW / AVX2 CSV Scanner (`src/csv_parse.hpp`):**
-   - Replaces ~15 `std::memchr` calls per 72-byte event line with one 64-byte SIMD load classifying `\n`, `,`, and `"` simultaneously (`_mm512_cmpeq_epi8_mask` on Cascade Lake; dual `_mm256_movemask_epi8` on AVX2).
-   - Extracts field boundaries via `ctzll` / `blsr` (`any &= any - 1`) and skips per-field quote scanning when `quote_cnt == 0`.
-   - **32-entry L1 `DateLut`** validates `"YYYY-MM-DD"` in two loads for dates in the 28-day span around the window (covering F1, F2, and late `ingest_ts`), falling back to `parse_iso19` outside.
-   - **Branchless SWAR 13-digit F3 parser** (`parse_13d_swar`) validates and converts standard 13-digit epoch ms without division or per-byte branching.
-
-4. **Parallel 32-Shard `LinkTable` with 16-Byte `LinkSlot` + Deferred Prefetched Lookups (`src/union_find.hpp`, `src/main.cpp`):**
-   - Link CSV parsing, string interning into 32 `OverflowArena` shards (`16 B` `LinkSlot { CompactStr key; uint32_t val; }`, `key.d[11] == 0` empty sentinel), and canonical ID back-propagation all run in parallel; only pure-integer Union-Find runs single-threaded.
-   - **Deferred link resolution:** Phase 2 (`events`) skips `LinkTable` completely (meaning tombstones, late/invalid events, and duplicate event copies never probe `LinkTable`). Phase 3 resolves `LinkTable` only on surviving events using **16-ahead `__builtin_prefetch`** over `wyhash64(user_id)`. Phase 4 likewise uses a 16-item mini-batch with `__builtin_prefetch` on clicks.
-
-5. **Compact `FastPack` Memory Layout & L3-Resident Dedup (`src/main.cpp`, `src/hash_util.hpp`):**
-   - When the dataset window fits in `< 49.7 days` (`<= 0xFFFFFFFE ms`) and `categories <= 255` (true for all generated and fixture datasets, with an automatic `FastPack = false` 64-bit fallback template otherwise):
-     - `RawEvent`: `48 B` (storing `ts_rel` relative to `window_start`, `(cat_id << 24) | price_cents`, and `CompactStr` 12-byte inline/overflow strings).
-     - `SurvivingEvent`: **`24 B`** (`CompactStr user_id`, `uint32_t ts_rel`, `uint32_t price_cat`, `uint32_t person_hash32`).
-     - `SurvivingClick`: **`36 B`**.
-     - `ShardEvent`: **`8 B`** (`(uint64_t(ts_rel) << 32) | price_cat`), sorted with 4-pass 8-bit **LSD radix sort** when `nev > 2048` (handles 1%-2% whale users and shared-kiosk components in `O(N)` time).
-   - **512 dedup buckets** using an **8-byte `DedupIdx { uint32_t idx_plus1; uint32_t hash32; }`** hash index table (~`1.5`–`3 MB` per thread, fitting comfortably inside Xeon L3 even at 60M events); duplicate winner updates only overwrite a 4-byte index.
-   - `ChunkedVec` blocks capped at `<= 64 KB` (below glibc's `128 KB` `M_MMAP_THRESHOLD`) so allocator blocks reuse heap arenas without `mmap`/`munmap` syscalls.
-   - **Single-pass CSR staging in Phase 5** caches `local_pid` from Pass 1, eliminating the second hash-table probe for both events and clicks.
-
-6. **Streaming Zero-Dependency Parquet v1 Writer (`src/parquet_writer.hpp`):**
-   - Direct Thrift Compact Protocol writer (`UNCOMPRESSED`, `PLAIN`, 250k-row row groups, 1 MB stdio buffers), emitting `INT32` for integer counts (`sessions`, `events`, `purchasing_sessions`, `assisted_sessions`) and `INT64` for `revenue_cents`, plus RLE runs (`>= 8` identical values) for nullable `top_category` definition levels.
-   - Reduces 20M Parquet output from `93.6 MB` to `76.2 MB`.
-
-7. **Build-Time Profile-Guided Optimization (`Dockerfile`):**
-   - Untimed Docker build compiles with `-fprofile-generate=/tmp/pgo -flto=auto`, runs on a 50k-event/15k-click/5k-link synthetic dataset matching generator distributions, and recompiles with `-fprofile-use=/tmp/pgo -fprofile-correction -flto=auto`.
+### Phase D: Transposed Campaign Reduction (`src/main.cpp`, `src/parquet_writer.hpp`)
+- Reduces transposed `flat_credits` and `flat_assists` across threads and writes `campaign_daily/part-0.parquet`.
 
 ---
 
-## 4. Measured Results & Benchmarks
-
-All tests run with `NCPU=8 MEM_GB=24` on an Intel i9-14900HX (`AVX2` path; Cascade Lake scorers additionally use the compiled-in `AVX-512BW` path):
+## 4. Verification & Benchmarks
 
 ### Correctness Verification
-- **Edge-case fixtures:** `36/36` passed both natively and inside the `linux/amd64` Docker container (`--network none --read-only --tmpfs /tmp:rw,size=64m --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus 8 --memory 24g --user 1000:1000`).
-- **1M official dev set (`seed 1`, `1,000,000` events, `250,000` clicks):** Exact `MATCH` against `dev-answer/` (`user_daily`: `117,038` rows; `campaign_daily`: `27,400` rows; `0` missing, `0` extra, `0` differing, `0` duplicate keys) both natively and inside Docker.
-- **Unit checks:** Exhaustive byte tests for `parse_13d_swar`, `DateLut` & leap years (`2028-02-29`, `2000-02-29`, `2027-02-29`, `2100-02-29`), and SIMD CSV quoting/`\r`/long-line/EOF edge cases.
+- **Unit Tests:** `sort_u64` and `sort_u64_hi31` exhaustively verified for all lengths `n = 0..512` across 7 distributions (uniform random, reverse, sorted, constant, 0/1, mod-3, and `0`/`UINT64_MAX` extremes).
+- **36/36 Official Fixtures (`A1`–`J4`):**
+  - `FastPack=true`: `36/36 PASSED`
+  - `FastPack=false` (`SS_FORCE_SLOW_PACK=1`): `36/36 PASSED`
+- **1M `dev/` Dataset vs `dev-answer/`:** `MATCH` (`117,038` `user_daily` rows, `27,400` `campaign_daily` rows, 0 differences).
+- **20M `d20m` Dataset (`20,000,000` events, `5,127,892` clicks, `400,000` links) vs Baseline:** `MATCH` (`2,246,306` `user_daily` rows, `28,014` `campaign_daily` rows, `3,407,788` total sessions, `6,680,740,085` revenue cents, `36,030,031` assisted sessions, 0 differences).
 
-### Performance Progression (Native Linux ext4)
-
-| Benchmark | Initial C++20 (`mmap`, uncompacted) | Optimized C++20 (`pread`+SIMD+Pack) | Optimized + PGO (`Dockerfile` binary) | Speedup |
-|---|---:|---:|---:|---:|
-| **1M Dev (`dev/`)** | `88.3 ms` | `56.7 ms` | — | **1.56×** |
-| **20M Scale (`seed 42`, run 2)** | `1,910.1 ms` | `965.1 ms` (`958.4 ms` best) | **`871.2 ms`** (`0.91 s` wall) | **2.19×** |
-| **20M `links`** | `303.0 ms` | `89.6 ms` | `94.6 ms` (`88.3 ms` r1) | **3.2×** |
-| **20M `events`** | `831.2 ms` | `384.4 ms` | `346.7 ms` (`338.7 ms` r1) | **2.40×** |
-| **20M `dedup`** | `302.5 ms` | `218.9 ms` | `200.1 ms` | **1.51×** |
-| **20M `clicks`** | `198.3 ms` | `83.3 ms` | `85.4 ms` (`81.7 ms` r1) | **2.32×** |
-| **20M `shards`** | `271.3 ms` | `156.3 ms` | `142.7 ms` | **1.90×** |
-| **20M Peak RSS** | `2,959,948 KB` (`2.82 GB`) | `1,384,792 KB` (`1.32 GB`) | `1,419,952 KB` (`1.35 GB`) | **2.08× less** |
-| **20M CPU Utilization** | `700%` (`11.91 s` user) | `714%` (`5.84 s` user) | **`765%`** (`5.97 s` user) | +65% core scaling |
-| **20M Parquet Output** | `93.6 MB` | `76.2 MB` | `76.2 MB` | **19% smaller** |
-
-*(Also measured inside Docker Desktop over Windows bind mount on 1M `dev`: internal runtime `778.8 ms` -> `623.6 ms`.)*
-
----
-
-## 5. Remaining Scope for Further Improvement (Ideas for Next Agent)
-
-1. **Duplicate `click_id` Safeguard vs Rules (`src/main.cpp`):**
-   - Currently Phase 4 does not run a global `click_id` dedup table because `rules.md` specifies duplicate clicks have identical values (`click_id, user_id, campaign_id, ts`). However, on a person with duplicated clicks, we sort those extra 1–3% copies in Phase 5; if any future adversarial dataset ever altered a duplicate click, deduplicating `(ts, click_id)` inside Phase 5 (for a single person, after sorting clicks) or hashing `click_id` would guard against it. Note: checking `click_id` uniqueness per person after sorting is essentially free (`O(nclk)` linear scan) ONLY if copies share `(user_id, ts)` — if copies differed in `user_id`, global dedup would be required, which `rules.md` explicitly states never happens ("Copies of a click have identical values").
-
-2. **PGO Training Profile Coverage for `AVX-512BW` (`Dockerfile`):**
-   - Look closely at `for_each_csv_line` in `src/csv_parse.hpp`: if the Docker build runs on a machine **without** AVX-512 (e.g., local build on Raptor Lake) or **with** AVX-512 (Google Cloud scorer), `-fprofile-generate` only trains whichever branch (`scan_csv_avx512` vs `scan_csv_avx2`) the build host supports. Since the scorer builds the Dockerfile **on the `n2` Cascade Lake machine itself**, it automatically profiles `scan_csv_avx512` on the scorer! Still, adding `-fprofile-values` or checking `g++` vs `clang++` (`clang-18` with ThinLTO + PGO + `libmimalloc`) is worth benchmarking.
-
-3. **Eliminate `raw_ev_buckets` Intermediate `ChunkedVec` Copy in Phase 3 (`dedup` = 200 ms):**
-   - Currently Phase 3 copies `raw_ev_buckets[*][b]` into `flat_evs` (`200 ms` total for dedup) before indexing `DedupIdx`. Instead, we could store a small `(thread_id, block_idx)` pointer array or flatten directly via `memcpy` per block (`memcpy` is already fast, so `200 ms` is mostly `wyhash64(user_id)` + `LinkTable` lookups + writing `ev_person_buckets`). Splitting `wyhash64` + `LinkTable` prefetch into `dedup` or tuning `kDedupBuckets = 1024` (halving `flat_evs` + `idx_table` per bucket to ~1.5 MB so it stays strictly inside L2/L3 cache slices per core) could shave another ~30–50 ms.
-
-4. **Overlapping `pread()` I/O & Compute or `io_uring` / `readahead`:**
-   - Currently `events` takes `338–347 ms` on 20M (~39% of total runtime), reading `1.8 GB` across `24`–`160` files. Calling `posix_fadvise(..., POSIX_FADV_WILLNEED)` across the first few chunks (or opening/advising files in parallel) and increasing `kChunkBytes` vs `1 MB`–`2 MB` (`512 KB` chunks improve tail load-balancing when a Zipf-sized largest file holds ~20% of rows) is worth testing.
-
-5. **Fused Two-Vector Parsing in `events` + Fast `product_map` (`events` = 340 ms):**
-   - In `events`, 97% of rows are `view` or `cart` (already skipping `product_map`), and `f[4]` is checked with `std::string_view::operator==`. Checking `f[4].size() == 4 && memcmp == "view"` or switching on `f[4].size()` (`4`, `8`) avoids redundant checks.
-   - `product_map` (`50,000` products, only queried on the 3% `purchase` rows!) is currently ~2 MB (`FlatStrMap<uint32_t>`). Replacing `product_map` with a 16-byte `CompactStr` slot table (`~1.5 MB`) shrinks it inside L3 cache.
-   - Also check `campaign_map` (`2,000` campaigns): fits in L1/L2 (~64 KB) if packed into a 16-byte slot table instead of `FlatStrMap` (`OverflowArena` indirection).
-
-6. **Parallelize `campaign_daily` Write / Eliminate `UserDailyParquetWriter` `Buf` Copies:**
-   - Writing `user_id` strings into `UserDailyParquetWriter` calls `Buf::le32` + `Buf::bytes` (`resize` + `memcpy`). Using a direct raw cursor `uint8_t* ptr` in a preallocated 8 MB row-group buffer removes `std::vector::resize` bounds checks on every row.
-   - `user_daily` currently writes `UNCOMPRESSED` Parquet (fastest CPU, ~75 MB at 20M, ~225 MB at 60M), which is optimal on local NVMe/tmpfs scratch disk, though `LZ4_RAW` / `SNAPPY` shouldn't be needed since disk limit is 50 GB.
-
-7. **Memory Allocator (`mimalloc` / `jemalloc`):**
-   - Linking `-lmimalloc` (available via Debian `libmimalloc-dev` or header-only build) can speed up `ChunkedVec` / `std::vector` block allocations and cross-thread frees (`raw_ev_buckets` allocated on thread `t`, freed on thread `b` in Phase 3, and `ev_person_buckets` freed across threads in Phase 5!). Cross-thread `delete[]` in glibc `ptmalloc2` triggers arena locking; `mimalloc` handles cross-thread frees lock-free!
-
-8. **Verify `60M`-Event Final Scale (`~5.4 GB` CSVs):**
-   - At 60M events (`15M` clicks), peak RSS is projected at ~`4.1 GB` (well below `24 GB`), and projected runtime on Cascade Lake is ~`3–5 s` (well below the `180 s` cap). Worth running one local 60M-event test (`generate --seed 7 --events 60000000 --clicks 15000000`) to confirm peak RSS and shard load balance (especially for the 3–6 shared-kiosk components!).
+### 20M Benchmark Progression (`NCPU=8`, Warm Page Cache)
+| Version | Internal `done in` | External `py_wall` | Phase Breakdown (`init / links / events / dedup+clk / shards / camp`) |
+| :--- | :---: | :---: | :--- |
+| Baseline (`git HEAD`) | `665.2 ms` | `~710 ms` | `links 113.0, events 246.7, dedup+clk 144.6, shards 158.4, camp 2.5` |
+| Pass 1 (`FastId64` + 64-shard `LinkTable` + `ThreadBlockArena` + `mmap`) | `452.2 ms` | `500.0 ms` | `init 16.5, links 44.1, events 151.5, dedup+clk 121.0, shards 117.4, camp 1.7` |
+| Pass 1 + PGO | `426.9 ms` (`441.3 ms` `taskset -c 0-7`) | `470.0 ms` (`486.0 ms` `taskset -c 0-7`) | `init 16.8, links 42.1, events 142.3, dedup+clk 113.8, shards 110.2, camp 1.7` |
+| Pass 2 (`256 KB` `pread` + lock-free 64-subtable `LinkTable` + `sort_u64` networks/BlockQSort + L1 active set) | `474.0–475.0 ms` (`485.6 ms` PGO) | `491.2 ms` (`494.7 ms` PGO; `_exit` overhead cut from `47.8 ms` to `8.0–9.1 ms`; `shards` cut to `100.8–102.3 ms`; `links` cut to `41.2–41.6 ms`) | `init 17.6, links 43.1, events 160.6, dedup+clk 138.4, shards 113.5, camp 1.9` |

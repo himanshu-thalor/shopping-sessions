@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <mutex>
 #include <new>
 #include <string_view>
 #include <sys/mman.h>
@@ -79,13 +78,6 @@ inline uint64_t wyhash64(const char* data, size_t len) noexcept {
 
 inline uint64_t wyhash64(std::string_view sv) noexcept {
     return wyhash64(sv.data(), sv.size());
-}
-
-inline uint64_t hash_inline_12(uint64_t lo, uint32_t hi) noexcept {
-    uint64_t h = wyhash_mix(lo ^ 0xa0761d6478bd642full,
-                            static_cast<uint64_t>(hi) ^ 0xe7037ed1a0b428dbull);
-    h = wyhash_mix(h, 0x8ebc6af09c88c6e3ull);
-    return h ? h : 1;
 }
 
 inline bool byte_less(std::string_view a, std::string_view b) noexcept {
@@ -177,123 +169,108 @@ class HugeBuffer {
     size_t mapped_bytes_ = 0;
 };
 
-class HugeBlockPool {
+// Lock-free per-thread 64 KB block allocator backed by 2MB-aligned THP mmap slabs.
+class ThreadBlockArena {
    public:
-    explicit HugeBlockPool(size_t block_bytes) : block_bytes_(block_bytes) {}
-    HugeBlockPool(const HugeBlockPool&) = delete;
-    HugeBlockPool& operator=(const HugeBlockPool&) = delete;
+    static constexpr size_t kBlockBytes = 65536;
 
-    ~HugeBlockPool() {
-        for (const auto& r : regions_) {
-            ::munmap(r.ptr, r.bytes);
-        }
+    ThreadBlockArena() = default;
+    ThreadBlockArena(const ThreadBlockArena&) = delete;
+    ThreadBlockArena& operator=(const ThreadBlockArena&) = delete;
+
+    ThreadBlockArena(ThreadBlockArena&& other) noexcept
+        : slabs_(std::move(other.slabs_)),
+          free_blocks_(std::move(other.free_blocks_)),
+          slab_cur_(other.slab_cur_),
+          slab_end_(other.slab_end_),
+          next_slab_bytes_(other.next_slab_bytes_) {
+        other.slab_cur_ = nullptr;
+        other.slab_end_ = nullptr;
     }
 
-    size_t block_bytes() const noexcept { return block_bytes_; }
-
-    size_t alloc_batch(void** out, size_t max_n) {
-        std::lock_guard<std::mutex> lk(mu_);
-        size_t got = 0;
-        while (got < max_n && !free_list_.empty()) {
-            out[got++] = free_list_.back();
-            free_list_.pop_back();
+    ThreadBlockArena& operator=(ThreadBlockArena&& other) noexcept {
+        if (this != &other) {
+            release_all();
+            slabs_ = std::move(other.slabs_);
+            free_blocks_ = std::move(other.free_blocks_);
+            slab_cur_ = other.slab_cur_;
+            slab_end_ = other.slab_end_;
+            next_slab_bytes_ = other.next_slab_bytes_;
+            other.slab_cur_ = nullptr;
+            other.slab_end_ = nullptr;
         }
-        while (got < max_n) {
-            grow_locked();
-            while (got < max_n && !free_list_.empty()) {
-                out[got++] = free_list_.back();
-                free_list_.pop_back();
-            }
-        }
-        return got;
+        return *this;
     }
 
-    void free_batch(void* const* in, size_t n) {
-        if (n == 0) return;
-        std::lock_guard<std::mutex> lk(mu_);
-        free_list_.insert(free_list_.end(), in, in + n);
+    ~ThreadBlockArena() { release_all(); }
+
+    void* alloc() {
+        if (__builtin_expect(!free_blocks_.empty(), 1)) {
+            void* p = free_blocks_.back();
+            free_blocks_.pop_back();
+            return p;
+        }
+        if (__builtin_expect(slab_cur_ == slab_end_, 0)) {
+            alloc_slab();
+        }
+        void* p = slab_cur_;
+        slab_cur_ += kBlockBytes;
+        return p;
+    }
+
+    void recycle(void* p) {
+        if (p) free_blocks_.push_back(p);
+    }
+
+    void release_all() noexcept {
+        for (const auto& s : slabs_) {
+            ::munmap(s.ptr, s.bytes);
+        }
+        std::vector<Slab>().swap(slabs_);
+        std::vector<void*>().swap(free_blocks_);
+        slab_cur_ = nullptr;
+        slab_end_ = nullptr;
     }
 
    private:
-    struct Region {
+    struct Slab {
         void* ptr;
         size_t bytes;
     };
 
-    void grow_locked() {
+    __attribute__((noinline)) void alloc_slab() {
         constexpr size_t kHuge = size_t(2) << 20;
-        const size_t reg_bytes = next_reg_bytes_;
-        if (next_reg_bytes_ < (size_t(16) << 20)) next_reg_bytes_ <<= 1;
+        const size_t slab_bytes = next_slab_bytes_;
+        if (next_slab_bytes_ < (size_t(16) << 20)) next_slab_bytes_ <<= 1;
 
-        const size_t map_sz = reg_bytes + kHuge;
+        const size_t map_sz = slab_bytes + kHuge;
         void* raw = ::mmap(nullptr, map_sz, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (raw == MAP_FAILED) throw std::bad_alloc();
 
-        uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
-        uintptr_t aligned = (addr + kHuge - 1) & ~(uintptr_t(kHuge) - 1);
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
+        const uintptr_t aligned = (addr + kHuge - 1) & ~(uintptr_t(kHuge) - 1);
         if (aligned > addr) ::munmap(raw, aligned - addr);
-        const size_t tail = (addr + map_sz) - (aligned + reg_bytes);
-        if (tail > 0) ::munmap(reinterpret_cast<void*>(aligned + reg_bytes), tail);
-        ::madvise(reinterpret_cast<void*>(aligned), reg_bytes, MADV_HUGEPAGE);
+        const size_t tail = (addr + map_sz) - (aligned + slab_bytes);
+        if (tail > 0) ::munmap(reinterpret_cast<void*>(aligned + slab_bytes), tail);
+        ::madvise(reinterpret_cast<void*>(aligned), slab_bytes, MADV_HUGEPAGE);
 
-        regions_.push_back(Region{reinterpret_cast<void*>(aligned), reg_bytes});
-        char* base = reinterpret_cast<char*>(aligned);
-        const size_t nblocks = reg_bytes / block_bytes_;
-        free_list_.reserve(free_list_.size() + nblocks);
-        // Push in reverse so pops yield ascending addresses
-        for (size_t i = nblocks; i-- > 0;) {
-            free_list_.push_back(base + i * block_bytes_);
-        }
+        slabs_.push_back(Slab{reinterpret_cast<void*>(aligned), slab_bytes});
+        slab_cur_ = reinterpret_cast<char*>(aligned);
+        slab_end_ = slab_cur_ + slab_bytes;
     }
 
-    size_t block_bytes_;
-    size_t next_reg_bytes_ = size_t(2) << 20;
-    std::mutex mu_;
-    std::vector<Region> regions_;
-    std::vector<void*> free_list_;
+    std::vector<Slab> slabs_;
+    std::vector<void*> free_blocks_;
+    char* slab_cur_ = nullptr;
+    char* slab_end_ = nullptr;
+    size_t next_slab_bytes_ = size_t(4) << 20;
 };
 
-class ThreadBlockCache {
-   public:
-    explicit ThreadBlockCache(HugeBlockPool* pool = nullptr) : pool_(pool) {}
-
-    ~ThreadBlockCache() { flush_all(); }
-
-    void init(HugeBlockPool* pool) {
-        flush_all();
-        pool_ = pool;
-    }
-
-    void* alloc() {
-        if (cache_.empty()) {
-            void* tmp[8];
-            const size_t got = pool_->alloc_batch(tmp, 8);
-            cache_.insert(cache_.end(), tmp, tmp + got);
-        }
-        void* p = cache_.back();
-        cache_.pop_back();
-        return p;
-    }
-
-    void free(void* p) {
-        cache_.push_back(p);
-        if (cache_.size() >= 64) {
-            pool_->free_batch(cache_.data() + 32, cache_.size() - 32);
-            cache_.resize(32);
-        }
-    }
-
-    void flush_all() {
-        if (pool_ && !cache_.empty()) {
-            pool_->free_batch(cache_.data(), cache_.size());
-            cache_.clear();
-        }
-    }
-
-   private:
-    HugeBlockPool* pool_ = nullptr;
-    std::vector<void*> cache_;
+template <typename T>
+struct BlockSlice {
+    T* ptr;
+    uint32_t len;
 };
 
 struct OverflowArena {
@@ -337,10 +314,6 @@ struct OverflowArena {
             std::memcpy(big, sv.data(), len);
             const uint32_t bidx = static_cast<uint32_t>(blocks.size());
             blocks.push_back(big);
-            const size_t extra = (len - 1) >> BLOCK_SHIFT;
-            for (size_t i = 0; i < extra; ++i) {
-                blocks.push_back(nullptr);
-            }
             pos = BLOCK_SIZE;
             return bidx << BLOCK_SHIFT;
         }
@@ -360,156 +333,214 @@ struct OverflowArena {
     std::string_view get(uint32_t off, uint32_t len) const noexcept {
         return std::string_view(blocks[off >> BLOCK_SHIFT] + (off & BLOCK_MASK), len);
     }
+
+    uint64_t push_with_len(std::string_view sv) {
+        const uint32_t len = static_cast<uint32_t>(sv.size());
+        const size_t need = 4 + static_cast<size_t>(len);
+        if (need > BLOCK_SIZE) {
+            char* big = new char[need];
+            std::memcpy(big, &len, 4);
+            if (len > 0) std::memcpy(big + 4, sv.data(), len);
+            const uint64_t bidx = static_cast<uint64_t>(blocks.size());
+            blocks.push_back(big);
+            pos = BLOCK_SIZE;
+            return bidx << BLOCK_SHIFT;
+        }
+        if (pos + need > BLOCK_SIZE) {
+            blocks.push_back(new char[BLOCK_SIZE]);
+            pos = 0;
+        }
+        const uint64_t bidx = static_cast<uint64_t>(blocks.size() - 1);
+        const uint64_t off = (bidx << BLOCK_SHIFT) | static_cast<uint64_t>(pos);
+        char* dst = blocks.back() + pos;
+        std::memcpy(dst, &len, 4);
+        if (len > 0) std::memcpy(dst + 4, sv.data(), len);
+        pos += need;
+        return off;
+    }
+
+    std::string_view get_len_str(uint64_t off) const noexcept {
+        const char* p = blocks[off >> BLOCK_SHIFT] + (off & BLOCK_MASK);
+        uint32_t len = 0;
+        std::memcpy(&len, p, 4);
+        return std::string_view(p + 4, len);
+    }
 };
 
-struct alignas(4) CompactStr {
-    uint8_t d[12];
+// 8-byte compact ID optimized for "<Prefix><1..8 ASCII bytes>" (bit 63 == 0) with overflow fallback.
+// 0 == empty sentinel.
+template <char Prefix>
+struct FastId64 {
+    static constexpr uint64_t kLenMask[9] = {
+        0x0000000000000000ULL,
+        0x00000000000000FFULL,
+        0x000000000000FFFFULL,
+        0x0000000000FFFFFFULL,
+        0x00000000FFFFFFFFULL,
+        0x000000FFFFFFFFFFULL,
+        0x0000FFFFFFFFFFFFULL,
+        0x00FFFFFFFFFFFFFFULL,
+        0xFFFFFFFFFFFFFFFFULL,
+    };
 
-    static CompactStr make_inline(std::string_view sv) noexcept {
-        CompactStr s{};
-        if (sv.size() >= 8) {
-            // Overlap the two fixed-width loads for 8..11 byte identifiers.
-            std::memcpy(s.d, sv.data(), 8);
-            std::memcpy(s.d + sv.size() - 4, sv.data() + sv.size() - 4, 4);
-        } else if (!sv.empty()) {
-            std::memcpy(s.d, sv.data(), sv.size());
+    uint64_t raw = 0;
+
+    static inline uint64_t check_inline_word(uint64_t w, size_t len) noexcept {
+        const uint64_t m = kLenMask[len - 1];
+        w &= m;
+        const uint64_t active = w | ~m;
+        const uint64_t has_zero =
+            (active - 0x0101010101010101ULL) & ~active & 0x8080808080808080ULL;
+        if (__builtin_expect(((w & 0x8080808080808080ULL) | has_zero) == 0, 1)) {
+            return w;
         }
-        s.d[11] = static_cast<uint8_t>(sv.size());
-        return s;
+        return 0;
     }
 
-    static CompactStr make_overflow(uint32_t off, uint32_t len, uint16_t arena_id) noexcept {
-        CompactStr s{};
-        std::memcpy(s.d, &off, 4);
-        std::memcpy(s.d + 4, &len, 4);
-        std::memcpy(s.d + 8, &arena_id, 2);
-        s.d[11] = 0xFF;
-        return s;
-    }
-
-    static CompactStr make_str(std::string_view sv, uint16_t arena_id, OverflowArena& arena) {
-        if (sv.size() <= 11) {
-            return make_inline(sv);
+    // Caller guarantees at least 9 readable bytes starting at p.
+    static inline FastId64 try_inline_padded(const char* p, size_t len) noexcept {
+        if (__builtin_expect(len - 2 <= 7 && p[0] == Prefix, 1)) {
+            uint64_t w;
+            std::memcpy(&w, p + 1, 8);
+            return FastId64{check_inline_word(w, len)};
         }
-        const uint32_t off = arena.push(sv);
-        return make_overflow(off, static_cast<uint32_t>(sv.size()), arena_id);
+        return FastId64{0};
     }
 
-    static CompactStr make_linked(uint32_t node_id) noexcept {
-        CompactStr s{};
-        std::memcpy(s.d, &node_id, 4);
-        s.d[11] = 0xFE;
-        return s;
-    }
-
-    uint8_t tag() const noexcept { return d[11]; }
-    bool empty_sentinel() const noexcept { return d[11] == 0; }
-    bool is_linked() const noexcept { return d[11] == 0xFE; }
-    bool is_overflow() const noexcept { return d[11] == 0xFF; }
-    bool is_inline() const noexcept { return d[11] <= 11; }
-
-    uint32_t linked_id() const noexcept {
-        uint32_t v;
-        std::memcpy(&v, d, 4);
-        return v;
-    }
-
-    void overflow_info(uint32_t& off, uint32_t& len, uint16_t& arena_id) const noexcept {
-        std::memcpy(&off, d, 4);
-        std::memcpy(&len, d + 4, 4);
-        std::memcpy(&arena_id, d + 8, 2);
-    }
-
-    std::string_view raw_view(const OverflowArena* arenas) const noexcept {
-        if (d[11] <= 11) {
-            return std::string_view(reinterpret_cast<const char*>(d), d[11]);
+    static inline FastId64 try_inline_safe(std::string_view sv) noexcept {
+        const size_t len = sv.size();
+        if (__builtin_expect(len - 2 <= 7 && sv[0] == Prefix, 1)) {
+            uint64_t w = 0;
+            std::memcpy(&w, sv.data() + 1, len - 1);
+            return FastId64{check_inline_word(w, len)};
         }
-        uint32_t off, len;
-        uint16_t aid;
-        overflow_info(off, len, aid);
-        return arenas[aid].get(off, len);
+        return FastId64{0};
     }
 
-    static bool raw_equals(const CompactStr& a, const CompactStr& b,
-                           const OverflowArena* arenas) noexcept {
-        uint32_t a0, a1, a2, b0, b1, b2;
-        std::memcpy(&a0, a.d, 4);
-        std::memcpy(&a1, a.d + 4, 4);
-        std::memcpy(&a2, a.d + 8, 4);
-        std::memcpy(&b0, b.d, 4);
-        std::memcpy(&b1, b.d + 4, 4);
-        std::memcpy(&b2, b.d + 8, 4);
-        if (a0 == b0 && a1 == b1 && a2 == b2) return true;
-        if (a.d[11] != b.d[11] || a.d[11] != 0xFF) return false;
-        if (a1 != b1) return false;
-        uint32_t a_off, b_off;
-        uint16_t a_aid, b_aid;
-        a.overflow_info(a_off, a1, a_aid);
-        b.overflow_info(b_off, b1, b_aid);
-        const char* pa = arenas[a_aid].blocks[a_off >> OverflowArena::BLOCK_SHIFT] +
-                         (a_off & OverflowArena::BLOCK_MASK);
-        const char* pb = arenas[b_aid].blocks[b_off >> OverflowArena::BLOCK_SHIFT] +
-                         (b_off & OverflowArena::BLOCK_MASK);
-        return std::memcmp(pa, pb, a1) == 0;
+    static inline FastId64 make_overflow(std::string_view sv, uint16_t arena_id,
+                                         OverflowArena& arena) {
+        const uint64_t off = arena.push_with_len(sv);
+        return FastId64{(1ULL << 63) | (static_cast<uint64_t>(arena_id & 0x7FFFu) << 48) |
+                        (off & 0x0000FFFFFFFFFFFFULL)};
     }
 
-    static bool equals_cross(const CompactStr& a, const OverflowArena* arenas_a,
-                             const CompactStr& b, const OverflowArena* arenas_b) noexcept {
-        if (a.d[11] != b.d[11]) return false;
-        if (a.d[11] <= 11 || a.d[11] == 0xFE) {
-            uint32_t a0, a1, a2, b0, b1, b2;
-            std::memcpy(&a0, a.d, 4);
-            std::memcpy(&a1, a.d + 4, 4);
-            std::memcpy(&a2, a.d + 8, 4);
-            std::memcpy(&b0, b.d, 4);
-            std::memcpy(&b1, b.d + 4, 4);
-            std::memcpy(&b2, b.d + 8, 4);
-            return a0 == b0 && a1 == b1 && a2 == b2;
+    // Caller guarantees at least 9 readable bytes at sv.data().
+    static inline FastId64 make_str_padded(std::string_view sv, uint16_t arena_id,
+                                           OverflowArena& arena) {
+        FastId64 id = try_inline_padded(sv.data(), sv.size());
+        if (__builtin_expect(id.raw != 0, 1)) return id;
+        return make_overflow(sv, arena_id, arena);
+    }
+
+    static inline FastId64 make_str_safe(std::string_view sv, uint16_t arena_id,
+                                         OverflowArena& arena) {
+        FastId64 id = try_inline_safe(sv);
+        if (__builtin_expect(id.raw != 0, 1)) return id;
+        return make_overflow(sv, arena_id, arena);
+    }
+
+    inline bool empty() const noexcept { return raw == 0; }
+    inline bool is_inline() const noexcept { return (raw >> 63) == 0 && raw != 0; }
+    inline bool is_overflow() const noexcept { return (raw >> 63) != 0; }
+
+    inline uint16_t overflow_arena_id() const noexcept {
+        return static_cast<uint16_t>((raw >> 48) & 0x7FFFu);
+    }
+
+    inline uint64_t overflow_off() const noexcept {
+        return raw & 0x0000FFFFFFFFFFFFULL;
+    }
+
+    inline uint32_t inline_len() const noexcept {
+        return 9u - (static_cast<unsigned>(__builtin_clzll(raw)) >> 3);
+    }
+
+    // Caller guarantees dst has at least 16 writable bytes.
+    inline uint32_t write_inline_to(char* dst) const noexcept {
+        dst[0] = Prefix;
+        std::memcpy(dst + 1, &raw, 8);
+        return inline_len();
+    }
+
+    inline std::string_view view(const OverflowArena* const* arenas,
+                                 char (&scratch)[9]) const noexcept {
+        if (__builtin_expect(is_inline(), 1)) {
+            scratch[0] = Prefix;
+            std::memcpy(scratch + 1, &raw, 8);
+            return std::string_view(scratch, inline_len());
         }
-        std::string_view sa = a.raw_view(arenas_a);
-        std::string_view sb = b.raw_view(arenas_b);
+        if (raw == 0) return {};
+        return arenas[overflow_arena_id()]->get_len_str(overflow_off());
+    }
+
+    inline uint64_t hash(const OverflowArena* const* arenas) const noexcept {
+        if (__builtin_expect((raw >> 63) == 0, 1)) {
+            const uint64_t h = wyhash_mix(raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
+            return h ? h : 1;
+        }
+        const uint64_t h = wyhash64(arenas[overflow_arena_id()]->get_len_str(overflow_off()));
+        return h ? h : 1;
+    }
+
+    static inline uint64_t hash_sv(std::string_view sv) noexcept {
+        FastId64 id = try_inline_safe(sv);
+        if (__builtin_expect(id.raw != 0, 1)) {
+            const uint64_t h =
+                wyhash_mix(id.raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
+            return h ? h : 1;
+        }
+        const uint64_t h = wyhash64(sv);
+        return h ? h : 1;
+    }
+
+    // Caller guarantees at least 9 readable bytes at sv.data().
+    static inline uint64_t hash_sv_padded(std::string_view sv) noexcept {
+        FastId64 id = try_inline_padded(sv.data(), sv.size());
+        if (__builtin_expect(id.raw != 0, 1)) {
+            const uint64_t h =
+                wyhash_mix(id.raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
+            return h ? h : 1;
+        }
+        const uint64_t h = wyhash64(sv);
+        return h ? h : 1;
+    }
+
+    static inline bool equals(FastId64 a, FastId64 b,
+                              const OverflowArena* const* arenas) noexcept {
+        if (a.raw == b.raw) return true;
+        if (__builtin_expect(((a.raw & b.raw) >> 63) == 0, 1)) return false;
+        const std::string_view sa = arenas[a.overflow_arena_id()]->get_len_str(a.overflow_off());
+        const std::string_view sb = arenas[b.overflow_arena_id()]->get_len_str(b.overflow_off());
         return sa.size() == sb.size() &&
                (sa.empty() || std::memcmp(sa.data(), sb.data(), sa.size()) == 0);
     }
 
-    static bool equals_sv(const CompactStr& a, const OverflowArena* arenas_a,
-                          std::string_view sv) noexcept {
-        if (sv.size() <= 11) {
-            if (a.d[11] != sv.size()) return false;
-            return sv.empty() || std::memcmp(a.d, sv.data(), sv.size()) == 0;
+    static inline bool equals_sv(FastId64 a, std::string_view sv,
+                                 const OverflowArena* const* arenas) noexcept {
+        FastId64 b = try_inline_safe(sv);
+        if (__builtin_expect(b.raw != 0, 1)) {
+            return a.raw == b.raw;
         }
-        if (a.d[11] != 0xFF) return false;
-        std::string_view sa = a.raw_view(arenas_a);
-        return sa.size() == sv.size() && std::memcmp(sa.data(), sv.data(), sv.size()) == 0;
+        if (__builtin_expect((a.raw >> 63) == 0, 1)) return false;
+        const std::string_view sa = arenas[a.overflow_arena_id()]->get_len_str(a.overflow_off());
+        return sa.size() == sv.size() &&
+               (sv.empty() || std::memcmp(sa.data(), sv.data(), sv.size()) == 0);
     }
+
+    static inline bool less(FastId64 a, FastId64 b,
+                            const OverflowArena* const* arenas) noexcept {
+        if (__builtin_expect(((a.raw | b.raw) >> 63) == 0, 1)) {
+            return __builtin_bswap64(a.raw) < __builtin_bswap64(b.raw);
+        }
+        char sa_buf[9], sb_buf[9];
+        return byte_less(a.view(arenas, sa_buf), b.view(arenas, sb_buf));
+    }
+
+    bool operator==(const FastId64& o) const noexcept { return raw == o.raw; }
+    bool operator!=(const FastId64& o) const noexcept { return raw != o.raw; }
 };
-static_assert(sizeof(CompactStr) == 12);
-static_assert(std::is_trivially_copyable_v<CompactStr>);
-
-inline uint64_t fast_str_hash(std::string_view sv) noexcept {
-    if (sv.size() <= 11) {
-        CompactStr cs = CompactStr::make_inline(sv);
-        uint64_t lo;
-        uint32_t hi;
-        std::memcpy(&lo, cs.d, 8);
-        std::memcpy(&hi, cs.d + 8, 4);
-        return hash_inline_12(lo, hi);
-    }
-    const uint64_t h = wyhash64(sv);
-    return h ? h : 1;
-}
-
-inline uint64_t fast_compact_hash(const CompactStr& cs, const OverflowArena* arenas) noexcept {
-    if (cs.is_inline()) {
-        uint64_t lo;
-        uint32_t hi;
-        std::memcpy(&lo, cs.d, 8);
-        std::memcpy(&hi, cs.d + 8, 4);
-        return hash_inline_12(lo, hi);
-    }
-    const uint64_t h = wyhash64(cs.raw_view(arenas));
-    return h ? h : 1;
-}
+static_assert(sizeof(FastId64<'u'>) == 8);
+static_assert(std::is_trivially_copyable_v<FastId64<'u'>>);
 
 template <typename V>
 class FlatStrMap {
@@ -536,7 +567,7 @@ class FlatStrMap {
 
     const V* find(std::string_view sv) const noexcept {
         if (table_.empty()) return nullptr;
-        const uint64_t h = fast_str_hash(sv);
+        const uint64_t h = hash_sv(sv);
         const size_t mask = table_.size() - 1;
         size_t idx = static_cast<size_t>(h) & mask;
         for (;;) {
@@ -556,7 +587,7 @@ class FlatStrMap {
         if ((count_ + 1) * 20 >= table_.size() * 11) {
             rehash(table_.empty() ? 1024 : table_.size() * 2);
         }
-        const uint64_t h = fast_str_hash(sv);
+        const uint64_t h = hash_sv(sv);
         const size_t mask = table_.size() - 1;
         size_t idx = static_cast<size_t>(h) & mask;
         for (;;) {
@@ -586,6 +617,11 @@ class FlatStrMap {
     }
 
    private:
+    static uint64_t hash_sv(std::string_view sv) noexcept {
+        const uint64_t h = wyhash64(sv);
+        return h ? h : 1;
+    }
+
     void rehash(size_t new_cap) {
         std::vector<Slot> next(new_cap);
         const size_t mask = new_cap - 1;
@@ -601,110 +637,4 @@ class FlatStrMap {
     OverflowArena arena_;
     std::vector<Slot> table_;
     size_t count_ = 0;
-};
-
-template <typename T, size_t BlockCap = 1024>
-class ChunkedVec {
-    static_assert((BlockCap & (BlockCap - 1)) == 0);
-    static_assert(std::is_trivially_copyable_v<T>);
-    static_assert(std::is_trivially_destructible_v<T>);
-
-   public:
-    explicit ChunkedVec(ThreadBlockCache* cache = nullptr) : cache_(cache) {}
-    ChunkedVec(const ChunkedVec&) = delete;
-    ChunkedVec& operator=(const ChunkedVec&) = delete;
-    ChunkedVec(ChunkedVec&& other) noexcept
-        : cache_(other.cache_),
-          blocks_(std::move(other.blocks_)),
-          cur_(other.cur_),
-          end_(other.end_),
-          full_count_(other.full_count_) {
-        other.cur_ = nullptr;
-        other.end_ = nullptr;
-        other.full_count_ = 0;
-    }
-    ChunkedVec& operator=(ChunkedVec&& other) noexcept {
-        if (this != &other) {
-            clear_and_free();
-            cache_ = other.cache_;
-            blocks_ = std::move(other.blocks_);
-            cur_ = other.cur_;
-            end_ = other.end_;
-            full_count_ = other.full_count_;
-            other.cur_ = nullptr;
-            other.end_ = nullptr;
-            other.full_count_ = 0;
-        }
-        return *this;
-    }
-    ~ChunkedVec() { clear_and_free(); }
-
-    void set_cache(ThreadBlockCache* cache) noexcept { cache_ = cache; }
-
-    void push_back(const T& item) {
-        if (__builtin_expect(cur_ == end_, 0)) {
-            grow();
-        }
-        *cur_++ = item;
-    }
-
-    size_t size() const noexcept {
-        if (blocks_.empty()) return 0;
-        return full_count_ + static_cast<size_t>(cur_ - blocks_.back());
-    }
-
-    bool empty() const noexcept { return blocks_.empty(); }
-
-    size_t num_blocks() const noexcept { return blocks_.size(); }
-
-    T* block_ptr(size_t bi) const noexcept { return blocks_[bi]; }
-
-    size_t block_len(size_t bi) const noexcept {
-        return (bi + 1 < blocks_.size()) ? BlockCap
-                                         : static_cast<size_t>(cur_ - blocks_.back());
-    }
-
-    template <typename Fn>
-    void for_each_block(Fn&& fn) const {
-        if (blocks_.empty()) return;
-        const size_t nblocks = blocks_.size();
-        for (size_t i = 0; i + 1 < nblocks; ++i) {
-            fn(blocks_[i], BlockCap);
-        }
-        fn(blocks_.back(), static_cast<size_t>(cur_ - blocks_.back()));
-    }
-
-    void free_to(ThreadBlockCache* target_cache) noexcept {
-        for (T* b : blocks_) {
-            if (target_cache) {
-                target_cache->free(b);
-            } else {
-                ::operator delete[](b);
-            }
-        }
-        std::vector<T*>().swap(blocks_);
-        cur_ = nullptr;
-        end_ = nullptr;
-        full_count_ = 0;
-    }
-
-    void clear_and_free() noexcept { free_to(cache_); }
-
-   private:
-    __attribute__((noinline)) void grow() {
-        if (!blocks_.empty()) {
-            full_count_ += BlockCap;
-        }
-        T* b = cache_ ? static_cast<T*>(cache_->alloc())
-                      : static_cast<T*>(::operator new[](sizeof(T) * BlockCap));
-        blocks_.push_back(b);
-        cur_ = b;
-        end_ = b + BlockCap;
-    }
-
-    ThreadBlockCache* cache_ = nullptr;
-    std::vector<T*> blocks_;
-    T* cur_ = nullptr;
-    T* end_ = nullptr;
-    size_t full_count_ = 0;
 };
