@@ -464,11 +464,6 @@ void process_events_chunk(bool use_avx512, const PreadView& view, uint16_t aid, 
             return;
         }
 
-        const EventId64 eid = is_padded ? EventId64::make_str_padded(row[0], aid, ea)
-                                        : EventId64::make_str_safe(row[0], aid, ea);
-        const uint64_t eh = eid.hash(ea_ptrs);
-        const size_t b = static_cast<size_t>(eh >> dedup_shift);
-
         bool valid = !row[1].empty() && !row[5].empty();
         int64_t ts_ms = 0;
         if (__builtin_expect(valid, 1)) {
@@ -476,6 +471,11 @@ void process_events_chunk(bool use_avx512, const PreadView& view, uint16_t aid, 
                     ts_ms >= event_win_start && ts_ms < event_win_end &&
                     (ingest_ms - ts_ms) <= kLateCutoffMs;
         }
+
+        const EventId64 eid = is_padded ? EventId64::make_str_padded(row[0], aid, ea)
+                                        : EventId64::make_str_safe(row[0], aid, ea);
+        const uint64_t eh = eid.hash(ea_ptrs);
+        const size_t b = static_cast<size_t>(eh >> dedup_shift);
 
         uint32_t price_cents = 0;
         uint32_t cat_id = 0;
@@ -1282,6 +1282,16 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                             win_hi = sess.start_key;
                         }
 
+                        while (l < r && clk_ts_fn(l) < win_lo) {
+                            const uint32_t c = clk_camp_fn(l);
+                            auto& st = cstate[c];
+                            if (--st.count == 0) {
+                                if (k > st.enter) {
+                                    day_assists[c] += static_cast<int32_t>(k - st.enter);
+                                }
+                            }
+                            ++l;
+                        }
                         if (l == r) {
                             while (r < mclk && clk_ts_fn(r) < win_lo) ++r;
                             l = r;
@@ -1297,16 +1307,6 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                                 }
                             }
                             ++r;
-                        }
-                        while (l < r && clk_ts_fn(l) < win_lo) {
-                            const uint32_t c = clk_camp_fn(l);
-                            auto& st = cstate[c];
-                            if (--st.count == 0) {
-                                if (k > st.enter) {
-                                    day_assists[c] += static_cast<int32_t>(k - st.enter);
-                                }
-                            }
-                            ++l;
                         }
                         const uint32_t credit_camp = (l < r) ? clk_camp_fn(r - 1) : 0u;
                         ++day_sess[credit_camp];
@@ -1416,9 +1416,9 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                 const uint32_t min_ts = static_cast<uint32_t>(sessions.front().start_key);
                 const uint32_t max_ts =
                     static_cast<uint32_t>(sessions.back().start_key + kClickReachMs);
-                uint64_t small_pkeys[32];
+                uint64_t small_pkeys[64];
                 uint64_t* pkeys = small_pkeys;
-                if (nclk > 32) {
+                if (__builtin_expect(nclk > 64, 0)) {
                     ctx.packed_clk_keys.resize(nclk);
                     pkeys = ctx.packed_clk_keys.data();
                 }

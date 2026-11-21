@@ -485,10 +485,10 @@ template <size_t N>
         const uint64_t q_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(vc, _mm256_set1_epi8('"'))));
         const size_t a0 = extract_fields_64<3, false>(d0a, p, f);
         if (__builtin_expect(a0 > 0 && a0 < 64, 1)) {
-            const unsigned sh = static_cast<unsigned>(64 - a0);
-            const Delimiters d0b{(d0a.commas >> a0) | (c_hi << sh),
-                                 (d0a.newlines >> a0) | (n_hi << sh),
-                                 (d0a.quotes >> a0) | (q_hi << sh)};
+            const Delimiters d0b{
+                static_cast<uint64_t>(((static_cast<__uint128_t>(c_hi) << 64) | d0a.commas) >> a0),
+                static_cast<uint64_t>(((static_cast<__uint128_t>(n_hi) << 64) | d0a.newlines) >> a0),
+                static_cast<uint64_t>(((static_cast<__uint128_t>(q_hi) << 64) | d0a.quotes) >> a0)};
             const size_t b0 = extract_fields_64<4, true>(d0b, p + a0, f + 3);
             return b0 ? (a0 + b0) : 0;
         }
@@ -555,10 +555,10 @@ SS_AVX512_ATTR [[gnu::always_inline]] inline size_t read_row_avx512(const char* 
         const auto d0c = delimiters32_avx512(p + 64);
         const size_t a0 = extract_fields_64<3, false>(d0a, p, f);
         if (__builtin_expect(a0 > 0 && a0 < 64, 1)) {
-            const unsigned sh = static_cast<unsigned>(64 - a0);
-            const Delimiters d0b{(d0a.commas >> a0) | (d0c.commas << sh),
-                                 (d0a.newlines >> a0) | (d0c.newlines << sh),
-                                 (d0a.quotes >> a0) | (d0c.quotes << sh)};
+            const Delimiters d0b{
+                static_cast<uint64_t>(((static_cast<__uint128_t>(d0c.commas) << 64) | d0a.commas) >> a0),
+                static_cast<uint64_t>(((static_cast<__uint128_t>(d0c.newlines) << 64) | d0a.newlines) >> a0),
+                static_cast<uint64_t>(((static_cast<__uint128_t>(d0c.quotes) << 64) | d0a.quotes) >> a0)};
             const size_t b0 = extract_fields_64<4, true>(d0b, p + a0, f + 3);
             return b0 ? (a0 + b0) : 0;
         }
@@ -624,17 +624,17 @@ template <size_t N, typename SlowCb>
             const size_t a1 = extract_fields_64<3, false>(d1a, p1, f1);                          \
             size_t b0 = 0, b1 = 0;                                                               \
             if (__builtin_expect(a0 > 0 && a0 < 64, 1)) {                                        \
-                const unsigned sh0 = static_cast<unsigned>(64 - a0);                             \
-                const Delimiters d0b{(d0a.commas >> a0) | (d0c.commas << sh0),                   \
-                                     (d0a.newlines >> a0) | (d0c.newlines << sh0),               \
-                                     (d0a.quotes >> a0) | (d0c.quotes << sh0)};                  \
+                const Delimiters d0b{                                                            \
+                    static_cast<uint64_t>(((static_cast<__uint128_t>(d0c.commas) << 64) | d0a.commas) >> a0),   \
+                    static_cast<uint64_t>(((static_cast<__uint128_t>(d0c.newlines) << 64) | d0a.newlines) >> a0), \
+                    static_cast<uint64_t>(((static_cast<__uint128_t>(d0c.quotes) << 64) | d0a.quotes) >> a0)};  \
                 b0 = extract_fields_64<4, true>(d0b, p0 + a0, f0 + 3);                           \
             }                                                                                    \
             if (__builtin_expect(a1 > 0 && a1 < 64, 1)) {                                        \
-                const unsigned sh1 = static_cast<unsigned>(64 - a1);                             \
-                const Delimiters d1b{(d1a.commas >> a1) | (d1c.commas << sh1),                   \
-                                     (d1a.newlines >> a1) | (d1c.newlines << sh1),               \
-                                     (d1a.quotes >> a1) | (d1c.quotes << sh1)};                  \
+                const Delimiters d1b{                                                            \
+                    static_cast<uint64_t>(((static_cast<__uint128_t>(d1c.commas) << 64) | d1a.commas) >> a1),   \
+                    static_cast<uint64_t>(((static_cast<__uint128_t>(d1c.newlines) << 64) | d1a.newlines) >> a1), \
+                    static_cast<uint64_t>(((static_cast<__uint128_t>(d1c.quotes) << 64) | d1a.quotes) >> a1)};  \
                 b1 = extract_fields_64<4, true>(d1b, p1 + a1, f1 + 3);                           \
             }                                                                                    \
             u0 = b0 ? (a0 + b0) : 0;                                                             \

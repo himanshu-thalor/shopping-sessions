@@ -101,35 +101,68 @@ template <size_t Pos, size_t Len>
     }
 }
 
-[[gnu::noinline]] inline void sort_u64_17_32(uint64_t* arr, size_t n,
-                                             std::vector<uint64_t>& scratch) {
+[[gnu::noinline]] inline void sort_u64_17_32(uint64_t* arr, size_t n) noexcept {
     bn_sort<0, 16>(arr);
     const size_t nb = n - 16;
     sort_u64_le16(arr + 16, nb);
 
-    if (scratch.size() < 32) scratch.resize(32);
-    uint64_t* const tmp = scratch.data();
+    uint64_t tmp[32];
     std::memcpy(tmp, arr, n * sizeof(uint64_t));
     const uint64_t* const a = tmp;
     const uint64_t* const b = tmp + 16;
-    size_t ia = 0;
-    size_t ib = 0;
-    for (size_t k = 0; k < n; ++k) {
-        const uint64_t va = a[ia < 16 ? ia : 15];
-        const uint64_t vb = b[ib < nb ? ib : (nb - 1)];
-        const bool take_a = (ib == nb) || (ia < 16 && va <= vb);
-        arr[k] = take_a ? va : vb;
+    size_t ia = 0, ib = 0, k = 0;
+    while (ia < 16 && ib < nb) {
+        const uint64_t va = a[ia];
+        const uint64_t vb = b[ib];
+        const bool take_a = (va <= vb);
+        arr[k++] = take_a ? va : vb;
         ia += static_cast<size_t>(take_a);
         ib += static_cast<size_t>(!take_a);
+    }
+    if (ia < 16) {
+        std::memcpy(arr + k, a + ia, (16 - ia) * sizeof(uint64_t));
+    } else if (ib < nb) {
+        std::memcpy(arr + k, b + ib, (nb - ib) * sizeof(uint64_t));
     }
 }
 
 [[gnu::always_inline]] inline void sort_u64_le32(uint64_t* arr, size_t n,
-                                                 std::vector<uint64_t>& scratch) {
+                                                 std::vector<uint64_t>&) noexcept {
     if (n <= 16) {
         sort_u64_le16(arr, n);
     } else {
-        sort_u64_17_32(arr, n, scratch);
+        sort_u64_17_32(arr, n);
+    }
+}
+
+[[gnu::noinline]] inline void sort_u64_33_64(uint64_t* arr, size_t n) noexcept {
+    bn_sort<0, 16>(arr);
+    bn_sort<16, 16>(arr);
+    bn_merge<0, 16, 16, 16>(arr);
+    const size_t nb = n - 32;
+    if (nb <= 16) {
+        sort_u64_le16(arr + 32, nb);
+    } else {
+        sort_u64_17_32(arr + 32, nb);
+    }
+
+    uint64_t tmp[64];
+    std::memcpy(tmp, arr, n * sizeof(uint64_t));
+    const uint64_t* const a = tmp;
+    const uint64_t* const b = tmp + 32;
+    size_t ia = 0, ib = 0, k = 0;
+    while (ia < 32 && ib < nb) {
+        const uint64_t va = a[ia];
+        const uint64_t vb = b[ib];
+        const bool take_a = (va <= vb);
+        arr[k++] = take_a ? va : vb;
+        ia += static_cast<size_t>(take_a);
+        ib += static_cast<size_t>(!take_a);
+    }
+    if (ia < 32) {
+        std::memcpy(arr + k, a + ia, (32 - ia) * sizeof(uint64_t));
+    } else if (ib < nb) {
+        std::memcpy(arr + k, b + ib, (nb - ib) * sizeof(uint64_t));
     }
 }
 
@@ -236,6 +269,10 @@ inline void sort_u64(uint64_t* arr, size_t n, std::vector<uint64_t>& scratch) {
         detail_sort::sort_u64_le32(arr, n, scratch);
         return;
     }
+    if (n <= 64) {
+        detail_sort::sort_u64_33_64(arr, n);
+        return;
+    }
     if (n < 256) {
         detail_sort::block_quicksort_u64(arr, arr + n, scratch);
         return;
@@ -295,6 +332,10 @@ inline void sort_u64_hi31(uint64_t* arr, size_t n, std::vector<uint64_t>& scratc
     if (n <= 1) return;
     if (n <= 32) {
         detail_sort::sort_u64_le32(arr, n, scratch);
+        return;
+    }
+    if (n <= 64) {
+        detail_sort::sort_u64_33_64(arr, n);
         return;
     }
     if (n < 256) {
