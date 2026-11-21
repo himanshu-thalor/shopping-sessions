@@ -6,6 +6,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -65,6 +66,23 @@ struct PreadView {
     size_t len = 0;
 };
 
+struct RawBuf {
+    std::unique_ptr<char[]> ptr;
+    size_t cap = 0;
+
+    void ensure(size_t need, size_t keep = 0) {
+        if (__builtin_expect(need <= cap, 1)) return;
+        size_t ncap = cap ? cap : size_t(280) << 10;
+        while (ncap < need) ncap <<= 1;
+        auto np = std::make_unique_for_overwrite<char[]>(ncap);
+        if (keep > 0 && ptr) std::memcpy(np.get(), ptr.get(), keep);
+        ptr = std::move(np);
+        cap = ncap;
+    }
+
+    char* data() noexcept { return ptr.get(); }
+};
+
 inline std::vector<std::string> list_csv_files(const std::string& dir) {
     std::vector<std::string> paths;
     DIR* d = ::opendir(dir.c_str());
@@ -119,6 +137,20 @@ inline PreadFile open_one_pread_file(const std::string& path) {
     pf.size = static_cast<size_t>(st.st_size);
     pf.path = path;
     return pf;
+}
+
+inline std::vector<PreadFile> open_all_pread_files_seq(const std::string& dir,
+                                                       size_t* out_total_bytes = nullptr) {
+    auto paths = list_csv_files(dir);
+    std::vector<PreadFile> files;
+    files.reserve(paths.size());
+    size_t total = 0;
+    for (const auto& path : paths) {
+        files.push_back(open_one_pread_file(path));
+        total += files.back().size;
+    }
+    if (out_total_bytes) *out_total_bytes = total;
+    return files;
 }
 
 inline std::vector<PreadFile> open_all_pread_files(const std::string& dir, ThreadPool& pool,
@@ -176,8 +208,7 @@ inline std::vector<PreadChunk> build_pread_chunks(const std::vector<PreadFile>& 
     return chunks;
 }
 
-inline bool read_chunk_into(const PreadFile& f, const PreadChunk& c, std::vector<char>& buf,
-                            PreadView& out) {
+inline bool read_chunk_into(const PreadFile& f, const PreadChunk& c, RawBuf& buf, PreadView& out) {
     static constexpr size_t kTailWindow = 4096;
     static constexpr size_t kPadBytes = 192;
     if (f.size == 0 || c.raw_start >= f.size) return false;
@@ -187,7 +218,7 @@ inline bool read_chunk_into(const PreadFile& f, const PreadChunk& c, std::vector
     size_t read_end = std::min(f.size, c.raw_end + kTailWindow);
     size_t len = read_end - read_base;
 
-    buf.resize(len + kPadBytes);
+    buf.ensure(len + kPadBytes);
     pread_exact(f.fd, buf.data(), len, read_base);
 
     auto ensure_len = [&](size_t need_end) {
@@ -195,7 +226,7 @@ inline bool read_chunk_into(const PreadFile& f, const PreadChunk& c, std::vector
         const size_t new_end = std::min(f.size, need_end);
         const size_t old_len = len;
         len = new_end - read_base;
-        buf.resize(len + kPadBytes);
+        buf.ensure(len + kPadBytes, old_len);
         pread_exact(f.fd, buf.data() + old_len, len - old_len, read_base + old_len);
         read_end = new_end;
     };

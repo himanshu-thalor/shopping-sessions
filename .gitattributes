@@ -1,0 +1,2 @@
+# A carriage return is field data in the input dialect, including before LF.
+fixtures/**/input/**/*.csv -text

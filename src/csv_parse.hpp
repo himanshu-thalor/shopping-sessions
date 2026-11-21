@@ -105,23 +105,21 @@ inline int32_t floor_div_day(int64_t ms) noexcept {
     const uint8_t d1 = static_cast<uint8_t>(p[1] - '0');
     const uint8_t d2 = static_cast<uint8_t>(p[2] - '0');
     const uint8_t d3 = static_cast<uint8_t>(p[3] - '0');
-    if (d0 > 9 || d1 > 9 || d2 > 9 || d3 > 9) return false;
+    if ((d0 > 9) | (d1 > 9) | (d2 > 9) | (d3 > 9)) return false;
     out = d0 * 1000 + d1 * 100 + d2 * 10 + d3;
     return true;
 }
 
 [[gnu::always_inline]] inline int32_t parse_hms_swar(const char* s) noexcept {
-    uint64_t w;
-    std::memcpy(&w, s, 8);
-    if (__builtin_expect((w & 0x0000FF0000FF0000ULL) != 0x00003A00003A0000ULL, 0)) return -1;
-    const uint64_t d = w - 0x30303A30303A3030ULL;
-    const uint64_t bad = (d | (d + 0x7676007676007676ULL)) & 0x8080008080008080ULL;
-    if (__builtin_expect(bad != 0, 0)) return -1;
-    const uint32_t hh = static_cast<uint32_t>((d & 0xFFu) * 10u + ((d >> 8) & 0xFFu));
-    const uint32_t mm = static_cast<uint32_t>(((d >> 24) & 0xFFu) * 10u + ((d >> 32) & 0xFFu));
-    const uint32_t ss = static_cast<uint32_t>(((d >> 48) & 0xFFu) * 10u + ((d >> 56) & 0xFFu));
-    if (__builtin_expect((hh > 23u) | (mm > 59u) | (ss > 59u), 0)) return -1;
-    return static_cast<int32_t>(hh * 3600u + mm * 60u + ss);
+    const __m128i raw = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s));
+    const __m128i d = _mm_xor_si128(raw, _mm_set_epi64x(0, 0x30303A30303A3030LL));
+    const __m128i excess = _mm_subs_epu8(d, _mm_set_epi64x(0, 0x0905000905000902LL));
+    if (__builtin_expect(!_mm_testz_si128(excess, excess), 0)) return -1;
+    const auto digits = _mm_shuffle_epi8(d, _mm_set_epi64x(-1, 0x8080070604030100ULL));
+    const auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010A));
+    const auto sums = _mm_madd_epi16(pairs, _mm_set_epi16(0, 0, 0, 0, 0, 1, 60, 3600));
+    const int sec = _mm_cvtsi128_si32(sums) + _mm_extract_epi32(sums, 1);
+    return sec < 86400 ? sec : -1;
 }
 
 struct FastDateLut {
@@ -172,7 +170,7 @@ struct FastDateLut {
     }
 };
 
-inline bool parse_iso19(const char* s, int64_t& out_utc_ms) noexcept {
+[[gnu::noinline]] inline bool parse_iso19(const char* s, int64_t& out_utc_ms) noexcept {
     if (s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':') {
         return false;
     }
@@ -252,29 +250,16 @@ inline bool parse_ts_f1(std::string_view sv, int64_t& out_ms) noexcept {
 }
 
 [[gnu::always_inline]] inline bool parse_13d_swar(const char* s, int64_t& out_ms) noexcept {
-    uint64_t w0;
-    uint32_t w1;
-    std::memcpy(&w0, s, 8);
-    std::memcpy(&w1, s + 8, 4);
-    const uint64_t bad0 =
-        (w0 | (w0 + 0x4646464646464646ULL) | (w0 - 0x3030303030303030ULL)) &
-        0x8080808080808080ULL;
-    const uint64_t w1u = static_cast<uint64_t>(w1);
-    const uint64_t bad1 =
-        (w1u | (w1u + 0x46464646ULL) | (w1u - 0x30303030ULL)) & 0x80808080ULL;
-    const uint8_t last_d = static_cast<uint8_t>(s[12] - '0');
-    if (__builtin_expect((bad0 | bad1) != 0 || last_d > 9, 0)) return false;
-
-    uint64_t d0 = w0 - 0x3030303030303030ULL;
-    d0 = ((d0 * 10 + (d0 >> 8)) & 0x00FF00FF00FF00FFULL);
-    d0 = ((d0 * 100 + (d0 >> 16)) & 0x0000FFFF0000FFFFULL);
-    d0 = ((d0 * 10000 + (d0 >> 32)) & 0x00000000FFFFFFFFULL);
-
-    uint64_t d1 = w1u - 0x30303030ULL;
-    d1 = ((d1 * 10 + (d1 >> 8)) & 0x00FF00FFULL);
-    d1 = ((d1 * 100 + (d1 >> 16)) & 0x0000FFFFULL);
-
-    out_ms = static_cast<int64_t>(d0 * 100000ULL + d1 * 10ULL + last_d);
+    const auto zero = _mm_set1_epi8('0');
+    const auto first = _mm_sub_epi8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s)), zero);
+    const auto last = _mm_sub_epi8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + 5)), zero);
+    const auto digits = _mm_unpacklo_epi64(_mm_slli_si128(first, 3), last);
+    const auto excess = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+    if (__builtin_expect(!_mm_testz_si128(excess, excess), 0)) return false;
+    const auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010A));
+    const auto quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+    const auto octets = _mm_madd_epi16(_mm_packs_epi32(quads, quads), _mm_set1_epi32(0x00012710));
+    out_ms = int64_t(_mm_cvtsi128_si32(octets)) * 100000000LL + _mm_extract_epi32(octets, 1);
     return true;
 }
 
@@ -325,7 +310,17 @@ inline bool parse_ts_f1(std::string_view sv, int64_t& out_ms) noexcept {
     }
     if (n == 25 && (s[19] == '+' || s[19] == '-') && s[22] == ':' && s[10] == 'T') {
         int64_t local_ms = 0;
-        if (!parse_iso19_swar(s, lut, local_ms)) return false;
+        uint64_t hi8;
+        uint16_t lo2;
+        std::memcpy(&hi8, s, 8);
+        std::memcpy(&lo2, s + 8, 2);
+        if (hint_valid && hi8 == hint_hi8 && lo2 == hint_lo2) {
+            const int32_t hms = parse_hms_swar(s + 11);
+            if (__builtin_expect(hms < 0, 0)) return false;
+            local_ms = hint_midnight_ms + static_cast<int64_t>(hms) * 1000LL;
+        } else if (!parse_iso19_swar(s, lut, local_ms)) {
+            return false;
+        }
         int64_t off_h = 0, off_m = 0;
         if (!parse_2d(s + 20, off_h) || !parse_2d(s + 23, off_m)) return false;
         if (off_h > 23 || off_m > 59) return false;
@@ -391,8 +386,6 @@ SS_AVX512_ATTR [[gnu::always_inline]] inline Delimiters delimiters_avx512(const 
             _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('"'))};
 }
 
-// Branchless quote/field extraction from 64-byte delimiter masks.
-// Returns bytes consumed up through Kth separator, or 0 to fall back.
 template <size_t K, bool EndOfLine>
 [[gnu::always_inline]] inline size_t extract_fields_64(const Delimiters& masks, const char* p,
                                                        std::string_view* fields) noexcept {
@@ -437,7 +430,6 @@ SS_AVX512_ATTR [[gnu::always_inline]] inline size_t read_fields_avx512(
     return extract_fields_64<K, EndOfLine>(delimiters_avx512(p), p, fields);
 }
 
-// Fast 32-byte single-load AVX2 path for 2-column links CSVs.
 [[gnu::always_inline]] inline size_t read_fields2_32_avx2(const char* p,
                                                           std::string_view* fields) noexcept {
     const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
@@ -512,37 +504,108 @@ template <size_t N, typename SlowCb>
     return w + 1;
 }
 
-#define SS_SCAN_PREAD_BODY(READ_EXPR)                            \
-    const char* const buf = view.data;                           \
-    size_t pos = view.pos;                                       \
-    const size_t limit = view.limit;                             \
-    const size_t len = view.len;                                 \
-    std::string_view f[N];                                       \
-    while (pos < limit) {                                        \
-        const char* p = buf + pos;                               \
+#define SS_SCAN_ONE_LOOP(POS, LIM, READ_EXPR)                    \
+    while ((POS) < (LIM)) {                                      \
+        const char* p = buf + (POS);                             \
         const size_t used = (READ_EXPR);                         \
         if (__builtin_expect(used != 0, 1)) {                    \
-            pos += used;                                         \
-            on_fast_row(f);                                      \
+            (POS) += used;                                       \
+            on_fast_row(f0);                                     \
         } else {                                                 \
-            pos += scan_slow_line<N>(p, len - pos, on_slow_row); \
+            (POS) += scan_slow_line<N>(p, len - (POS), on_slow_row); \
         }                                                        \
     }
+
+#define SS_SCAN_ILP2_BODY(DELIM_FN, READ_ONE_EXPR)                                               \
+    const char* const buf = view.data;                                                           \
+    size_t pos0 = view.pos;                                                                      \
+    const size_t limit = view.limit;                                                             \
+    const size_t len = view.len;                                                                 \
+    std::string_view f0[N];                                                                      \
+    if (limit - pos0 < 8192) {                                                                   \
+        SS_SCAN_ONE_LOOP(pos0, limit, READ_ONE_EXPR)                                             \
+        return;                                                                                  \
+    }                                                                                            \
+    const size_t mid_guess = pos0 + ((limit - pos0) >> 1);                                       \
+    const char* mid_nl =                                                                         \
+        static_cast<const char*>(std::memchr(buf + mid_guess, '\n', limit - mid_guess));         \
+    if (!mid_nl || static_cast<size_t>(mid_nl - buf) + 1 >= limit) {                             \
+        SS_SCAN_ONE_LOOP(pos0, limit, READ_ONE_EXPR)                                             \
+        return;                                                                                  \
+    }                                                                                            \
+    const size_t lim0 = static_cast<size_t>(mid_nl - buf) + 1;                                   \
+    size_t pos1 = lim0;                                                                          \
+    std::string_view batch[8][N];                                                                \
+    size_t nb = 0;                                                                               \
+    while (pos0 < lim0 && pos1 < limit) {                                                        \
+        const char* p0 = buf + pos0;                                                             \
+        const char* p1 = buf + pos1;                                                             \
+        size_t u0, u1;                                                                           \
+        if constexpr (N == 7) {                                                                  \
+            const auto d0a = DELIM_FN(p0);                                                       \
+            const auto d1a = DELIM_FN(p1);                                                       \
+            const size_t a0 = extract_fields_64<3, false>(d0a, p0, batch[nb]);                   \
+            const size_t a1 = extract_fields_64<3, false>(d1a, p1, batch[nb + 1]);               \
+            const size_t b0 =                                                                    \
+                a0 ? extract_fields_64<4, true>(DELIM_FN(p0 + a0), p0 + a0, batch[nb] + 3) : 0;  \
+            const size_t b1 =                                                                    \
+                a1 ? extract_fields_64<4, true>(DELIM_FN(p1 + a1), p1 + a1, batch[nb + 1] + 3)   \
+                   : 0;                                                                          \
+            u0 = b0 ? (a0 + b0) : 0;                                                             \
+            u1 = b1 ? (a1 + b1) : 0;                                                             \
+        } else if constexpr (N == 2) {                                                           \
+            u0 = read_fields2_32_avx2(p0, batch[nb]);                                            \
+            u1 = read_fields2_32_avx2(p1, batch[nb + 1]);                                        \
+        } else {                                                                                 \
+            const auto d0 = DELIM_FN(p0);                                                        \
+            const auto d1 = DELIM_FN(p1);                                                        \
+            u0 = extract_fields_64<N, true>(d0, p0, batch[nb]);                                  \
+            u1 = extract_fields_64<N, true>(d1, p1, batch[nb + 1]);                              \
+        }                                                                                        \
+        if (__builtin_expect(u0 != 0 && u1 != 0, 1)) {                                           \
+            pos0 += u0;                                                                          \
+            pos1 += u1;                                                                          \
+            nb += 2;                                                                             \
+            if (nb == 8) {                                                                       \
+                for (size_t i = 0; i < 8; ++i) on_fast_row(batch[i]);                            \
+                nb = 0;                                                                          \
+            }                                                                                    \
+        } else {                                                                                 \
+            for (size_t i = 0; i < nb; ++i) on_fast_row(batch[i]);                               \
+            if (u0 != 0) {                                                                       \
+                pos0 += u0;                                                                      \
+                on_fast_row(batch[nb]);                                                          \
+            } else {                                                                             \
+                pos0 += scan_slow_line<N>(p0, len - pos0, on_slow_row);                          \
+            }                                                                                    \
+            if (u1 != 0) {                                                                       \
+                pos1 += u1;                                                                      \
+                on_fast_row(batch[nb + 1]);                                                      \
+            } else {                                                                             \
+                pos1 += scan_slow_line<N>(p1, len - pos1, on_slow_row);                          \
+            }                                                                                    \
+            nb = 0;                                                                              \
+        }                                                                                        \
+    }                                                                                            \
+    for (size_t i = 0; i < nb; ++i) on_fast_row(batch[i]);                                       \
+    SS_SCAN_ONE_LOOP(pos0, lim0, READ_ONE_EXPR)                                                  \
+    SS_SCAN_ONE_LOOP(pos1, limit, READ_ONE_EXPR)
 
 template <size_t N, typename FastCb, typename SlowCb>
 [[gnu::noinline]] void scan_pread_buf_avx2(const PreadView& view, FastCb&& on_fast_row,
                                            SlowCb&& on_slow_row) {
-    SS_SCAN_PREAD_BODY(read_row_avx2<N>(p, f))
+    SS_SCAN_ILP2_BODY(delimiters_avx2, read_row_avx2<N>(p, f0))
 }
 
 template <size_t N, typename FastCb, typename SlowCb>
 SS_AVX512_ATTR [[gnu::noinline]] void scan_pread_buf_avx512(const PreadView& view,
                                                             FastCb&& on_fast_row,
                                                             SlowCb&& on_slow_row) {
-    SS_SCAN_PREAD_BODY(read_row_avx512<N>(p, f))
+    SS_SCAN_ILP2_BODY(delimiters_avx512, read_row_avx512<N>(p, f0))
 }
 
-#undef SS_SCAN_PREAD_BODY
+#undef SS_SCAN_ILP2_BODY
+#undef SS_SCAN_ONE_LOOP
 
 }  // namespace csv_simd
 

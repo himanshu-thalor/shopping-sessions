@@ -2,596 +2,449 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
+#include <bit>
 #include <cstdint>
-#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "csv_parse.hpp"
 #include "hash_util.hpp"
 #include "io_util.hpp"
-#include "thread_pool.hpp"
 
 class LinkTable {
    public:
-    using UserId64 = FastId64<'u'>;
-    static constexpr size_t kShards = 64;
-    static constexpr unsigned kShardShift = 64u - 6u;
-    static constexpr size_t kStrBlockCap = 4096;  // 4096 * 16B = 64 KB
+    using UserId = FastId64<'u'>;
+    static constexpr uint32_t kNone = UINT32_MAX;
 
-    struct LinkSlot {
-        UserId64 key;
-        UserId64 canon;
+    struct LinkedRoot {
+        UserId name;
+        uint32_t root_lid;
+        uint32_t pad;
     };
-    static_assert(sizeof(LinkSlot) == 16);
+    static_assert(sizeof(LinkedRoot) == 16);
 
-    struct StrItem {
-        UserId64 s;
-        uint32_t h32;
-        uint32_t ep;
-    };
-    static_assert(sizeof(StrItem) == 16);
-
-    OverflowArena& node_arena(size_t s) noexcept { return node_arenas_[s]; }
-    const OverflowArena& node_arena(size_t s) const noexcept { return node_arenas_[s]; }
-
-    void build(const std::string& links_dir, ThreadPool& pool,
-               std::vector<ThreadBlockArena>& arenas,
-               const OverflowArena* const* all_user_arenas, uint16_t link_arena_base) {
-        const auto lt0 = std::chrono::steady_clock::now();
-        size_t total_bytes = 0;
-        auto files = open_all_pread_files(links_dir, pool, &total_bytes);
-        auto chunks = build_pread_chunks(files, size_t(256) << 10);
-        if (chunks.empty()) return;
-
-        const size_t ncpu = pool.size();
-        std::vector<OverflowArena> tmp_arenas(ncpu);
-        std::vector<const OverflowArena*> tmp_arena_ptrs(ncpu);
-        for (size_t t = 0; t < ncpu; ++t) tmp_arena_ptrs[t] = &tmp_arenas[t];
-
-        std::vector<std::vector<uint32_t>> endpoints(ncpu);
-        std::vector<std::vector<std::vector<BlockSlice<StrItem>>>> shard_items(
-            ncpu, std::vector<std::vector<BlockSlice<StrItem>>>(kShards));
-
-        // Sub-phase 1: Parallel 256 KB pread + SIMD CSV scan
-        {
-            std::atomic<size_t> next_chunk{0};
-            const bool use_avx512 = cpu_has_avx512bw();
-            pool.run([&](size_t tid) {
-                ThreadBlockArena& my_arena = arenas[tid];
-                OverflowArena& ta = tmp_arenas[tid];
-                const OverflowArena* const* ta_ptrs = tmp_arena_ptrs.data();
-                const uint16_t aid = static_cast<uint16_t>(tid);
-                auto& out_shards = shard_items[tid];
-                std::vector<uint32_t>& my_eps = endpoints[tid];
-                my_eps.reserve(16384);
-
-                std::vector<char> chunk_buf;
-                PreadView view;
-
-                StrItem* cur[kShards]{};
-                StrItem* endp[kShards]{};
-                auto push_item = [&](size_t s, const StrItem& it) {
-                    if (__builtin_expect(cur[s] == endp[s], 0)) {
-                        if (cur[s] != nullptr) {
-                            out_shards[s].push_back(
-                                BlockSlice<StrItem>{cur[s] - kStrBlockCap, kStrBlockCap});
-                        }
-                        StrItem* blk = static_cast<StrItem*>(my_arena.alloc());
-                        cur[s] = blk;
-                        endp[s] = blk + kStrBlockCap;
-                    }
-                    *cur[s]++ = it;
-                };
-
-                auto handle_fast = [&](const std::string_view (&f)[2]) {
-                    if (__builtin_expect(f[0].empty() || f[1].empty(), 0)) return;
-                    const UserId64 ca = UserId64::make_str_padded(f[0], aid, ta);
-                    const UserId64 cb = UserId64::make_str_padded(f[1], aid, ta);
-                    if (__builtin_expect(ca.raw == cb.raw && ca.is_inline(), 0)) return;
-                    const uint64_t ha = ca.hash(ta_ptrs);
-                    const uint64_t hb = cb.hash(ta_ptrs);
-                    const uint32_t ep0 = static_cast<uint32_t>(my_eps.size());
-                    my_eps.push_back(0);
-                    my_eps.push_back(0);
-                    push_item(static_cast<size_t>(ha >> kShardShift),
-                              StrItem{ca, static_cast<uint32_t>(ha), ep0});
-                    push_item(static_cast<size_t>(hb >> kShardShift),
-                              StrItem{cb, static_cast<uint32_t>(hb), ep0 + 1});
-                };
-
-                auto handle_slow = [&](const std::string_view (&f)[2]) {
-                    if (__builtin_expect(f[0].empty() || f[1].empty(), 0)) return;
-                    const UserId64 ca = UserId64::make_str_safe(f[0], aid, ta);
-                    const UserId64 cb = UserId64::make_str_safe(f[1], aid, ta);
-                    if (__builtin_expect(ca.raw == cb.raw && ca.is_inline(), 0)) return;
-                    const uint64_t ha = ca.hash(ta_ptrs);
-                    const uint64_t hb = cb.hash(ta_ptrs);
-                    const uint32_t ep0 = static_cast<uint32_t>(my_eps.size());
-                    my_eps.push_back(0);
-                    my_eps.push_back(0);
-                    push_item(static_cast<size_t>(ha >> kShardShift),
-                              StrItem{ca, static_cast<uint32_t>(ha), ep0});
-                    push_item(static_cast<size_t>(hb >> kShardShift),
-                              StrItem{cb, static_cast<uint32_t>(hb), ep0 + 1});
-                };
-
-                for (;;) {
-                    const size_t ci = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                    if (ci >= chunks.size()) break;
-                    const PreadChunk& pc = chunks[ci];
-                    if (!read_chunk_into(files[pc.file_idx], pc, chunk_buf, view)) continue;
-                    if (use_avx512) {
-                        csv_simd::scan_pread_buf_avx512<2>(view, handle_fast, handle_slow);
-                    } else {
-                        csv_simd::scan_pread_buf_avx2<2>(view, handle_fast, handle_slow);
-                    }
-                }
-
-                for (size_t s = 0; s < kShards; ++s) {
-                    if (cur[s] != nullptr) {
-                        StrItem* base = endp[s] - kStrBlockCap;
-                        const uint32_t len = static_cast<uint32_t>(cur[s] - base);
-                        if (len > 0) out_shards[s].push_back(BlockSlice<StrItem>{base, len});
-                    }
-                }
-            });
-        }
-        const auto lt1 = std::chrono::steady_clock::now();
-        std::vector<PreadChunk>().swap(chunks);
-        std::vector<PreadFile>().swap(files);
-
-        // Sub-phase 2: Parallel 64-shard L2-resident interning
-        struct InternSlot {
-            UserId64 key;
-            uint32_t local_id;
+    struct Partition {
+        struct Entry {
+            UserId key;
+            uint32_t local;
+            uint32_t pad;
         };
-        std::vector<UserId64> shard_nodes[kShards];
-        {
-            std::atomic<size_t> next_shard{0};
-            pool.run([&](size_t tid) {
-                ThreadBlockArena& my_arena = arenas[tid];
-                std::vector<InternSlot> table;
+        static_assert(sizeof(Entry) == 16);
 
-                for (;;) {
-                    const size_t s = next_shard.fetch_add(1, std::memory_order_relaxed);
-                    if (s >= kShards) break;
+        std::vector<Entry> table;
+        std::vector<UserId> names;
+        uint32_t num_linked = 0;
+        uint32_t linked_base = 0;
 
-                    size_t tot = 0;
-                    for (size_t t = 0; t < ncpu; ++t) {
-                        for (const auto& sl : shard_items[t][s]) tot += sl.len;
-                    }
-                    if (tot == 0) continue;
-
-                    size_t cap = 64;
-                    while (cap * 6 < tot * 10 && cap < (size_t(1) << 18)) cap <<= 1;
-                    table.assign(cap, InternSlot{});
-                    size_t mask = cap - 1;
-                    size_t count = 0;
-                    OverflowArena& arena = node_arenas_[s];
-                    const uint16_t perm_aid = static_cast<uint16_t>(link_arena_base + s);
-                    auto& local_nodes = shard_nodes[s];
-                    local_nodes.reserve(std::min(tot, cap));
-
-                    auto rehash_shard = [&]() {
-                        const size_t ncap = table.size() * 2;
-                        std::vector<InternSlot> nxt(ncap, InternSlot{});
-                        const size_t nmask = ncap - 1;
-                        for (const InternSlot& sl : table) {
-                            if (sl.key.empty()) continue;
-                            const uint64_t h = sl.key.hash(all_user_arenas);
-                            size_t idx = static_cast<size_t>(h) & nmask;
-                            while (!nxt[idx].key.empty()) idx = (idx + 1) & nmask;
-                            nxt[idx] = sl;
-                        }
-                        table.swap(nxt);
-                        mask = nmask;
-                    };
-
-                    for (size_t t = 0; t < ncpu; ++t) {
-                        const OverflowArena& ta = tmp_arenas[t];
-                        for (const BlockSlice<StrItem>& blk : shard_items[t][s]) {
-                            const StrItem* items = blk.ptr;
-                            const size_t len = blk.len;
-                            for (size_t i = 0; i < len; ++i) {
-                                if (i + 4 < len) {
-                                    __builtin_prefetch(&table[items[i + 4].h32 & mask], 0, 1);
-                                }
-                                if ((count + 1) * 10 >= table.size() * 6) {
-                                    rehash_shard();
-                                }
-                                const StrItem& it = items[i];
-                                size_t idx = static_cast<size_t>(it.h32) & mask;
-                                for (;;) {
-                                    InternSlot& sl = table[idx];
-                                    if (sl.key.empty()) {
-                                        const uint32_t local_id =
-                                            static_cast<uint32_t>(local_nodes.size());
-                                        UserId64 interned = it.s;
-                                        if (it.s.is_overflow()) {
-                                            interned = UserId64::make_overflow(
-                                                ta.get_len_str(it.s.overflow_off()), perm_aid,
-                                                arena);
-                                        }
-                                        sl.key = interned;
-                                        sl.local_id = local_id;
-                                        local_nodes.push_back(interned);
-                                        ++count;
-                                        break;
-                                    }
-                                    if (sl.key.raw == it.s.raw) break;
-                                    if (((sl.key.raw & it.s.raw) >> 63) != 0) {
-                                        const std::string_view sa =
-                                            arena.get_len_str(sl.key.overflow_off());
-                                        const std::string_view sb =
-                                            ta.get_len_str(it.s.overflow_off());
-                                        if (sa.size() == sb.size() &&
-                                            (sa.empty() ||
-                                             std::memcmp(sa.data(), sb.data(), sa.size()) == 0)) {
-                                            break;
-                                        }
-                                    }
-                                    idx = (idx + 1) & mask;
-                                }
-                                endpoints[t][it.ep] =
-                                    (static_cast<uint32_t>(s) << 26) | table[idx].local_id;
-                            }
-                            my_arena.recycle(blk.ptr);
-                        }
-                        std::vector<BlockSlice<StrItem>>().swap(shard_items[t][s]);
-                    }
-                }
-            });
+        [[gnu::noinline]] void reserve(size_t expected, const OverflowArena* const* arenas) {
+            const size_t need = std::max<size_t>(64, (expected * 10 + 6) / 7);
+            const size_t cap = std::bit_ceil(need);
+            if (cap <= table.size()) return;
+            std::vector<Entry> bigger(cap);
+            const size_t mask = cap - 1;
+            for (const auto& e : table) {
+                if (e.key.empty()) continue;
+                size_t i = static_cast<size_t>(e.key.hash(arenas)) & mask;
+                while (!bigger[i].key.empty()) i = (i + 1) & mask;
+                bigger[i] = e;
+            }
+            table.swap(bigger);
         }
-        const auto lt2 = std::chrono::steady_clock::now();
 
-        uint32_t shard_base[kShards]{};
-        size_t num_nodes_sz = 0;
-        for (size_t s = 0; s < kShards; ++s) {
-            shard_base[s] = static_cast<uint32_t>(num_nodes_sz);
-            num_nodes_sz += shard_nodes[s].size();
-        }
-        if (num_nodes_sz == 0) return;
-
-        const uint32_t num_nodes = static_cast<uint32_t>(num_nodes_sz);
-        auto nodes = std::make_unique_for_overwrite<UserId64[]>(num_nodes);
-        if (num_nodes >= 8192 && ncpu > 1) {
-            std::atomic<size_t> next_s{0};
-            pool.run([&](size_t) {
-                for (;;) {
-                    const size_t s = next_s.fetch_add(1, std::memory_order_relaxed);
-                    if (s >= kShards) break;
-                    if (!shard_nodes[s].empty()) {
-                        std::memcpy(nodes.get() + shard_base[s], shard_nodes[s].data(),
-                                    shard_nodes[s].size() * sizeof(UserId64));
-                        std::vector<UserId64>().swap(shard_nodes[s]);
-                    }
+        [[gnu::noinline]] uint32_t intern_grow(UserId key, uint64_t hash,
+                                               const OverflowArena* const* arenas) {
+            reserve(std::max<size_t>(64, table.size() * 2), arenas);
+            const size_t mask = table.size() - 1;
+            size_t i = static_cast<size_t>(hash) & mask;
+            for (;;) {
+                Entry& e = table[i];
+                if (UserId::equals(e.key, key, arenas)) return e.local;
+                if (e.key.empty()) {
+                    const uint32_t n = static_cast<uint32_t>(names.size());
+                    e = Entry{key, n, 0};
+                    names.push_back(key);
+                    return n;
                 }
-            });
-        } else {
-            for (size_t s = 0; s < kShards; ++s) {
-                if (!shard_nodes[s].empty()) {
-                    std::memcpy(nodes.get() + shard_base[s], shard_nodes[s].data(),
-                                shard_nodes[s].size() * sizeof(UserId64));
-                    std::vector<UserId64>().swap(shard_nodes[s]);
-                }
+                i = (i + 1) & mask;
             }
         }
-        tmp_arenas.clear();
-        const auto lt3 = std::chrono::steady_clock::now();
 
-        // Sub-phase 3: Union-Find + canonical min_node + 64-subtable lock-free LinkTable build
-        size_t shard_non_id[kShards]{};
-        auto canon_idx = std::make_unique_for_overwrite<uint32_t[]>(num_nodes);
-
-        if (num_nodes < 8192 || ncpu == 1) {
-            std::vector<uint32_t> parent(num_nodes);
-            std::vector<uint8_t> rank(num_nodes, 0);
-            for (uint32_t i = 0; i < num_nodes; ++i) parent[i] = i;
-
-            auto find = [&](uint32_t x) -> uint32_t {
-                uint32_t r = x;
-                while (parent[r] != r) r = parent[r];
-                while (parent[x] != r) {
-                    const uint32_t nxt = parent[x];
-                    parent[x] = r;
-                    x = nxt;
+        [[gnu::always_inline]] inline uint32_t intern_local(UserId key, uint64_t hash,
+                                                            const OverflowArena* const* arenas) {
+            if (__builtin_expect(table.empty(), 0)) return intern_grow(key, hash, arenas);
+            const size_t mask = table.size() - 1;
+            size_t i = static_cast<size_t>(hash) & mask;
+            for (;;) {
+                Entry& e = table[i];
+                if (__builtin_expect(UserId::equals(e.key, key, arenas), 1)) return e.local;
+                if (e.key.empty()) {
+                    if (__builtin_expect((names.size() + 1) * 10 >= table.size() * 7, 0)) {
+                        return intern_grow(key, hash, arenas);
+                    }
+                    const uint32_t n = static_cast<uint32_t>(names.size());
+                    e = Entry{key, n, 0};
+                    names.push_back(key);
+                    return n;
                 }
-                return r;
+                i = (i + 1) & mask;
+            }
+        }
+
+        [[gnu::always_inline]] inline uint32_t find_local(
+            UserId key, uint64_t hash, const OverflowArena* const* arenas) const noexcept {
+            if (__builtin_expect(table.empty(), 0)) return kNone;
+            const size_t mask = table.size() - 1;
+            size_t i = static_cast<size_t>(hash) & mask;
+            for (;;) {
+                const Entry& e = table[i];
+                if (__builtin_expect(UserId::equals(e.key, key, arenas), 1)) return e.local;
+                if (e.key.empty()) return kNone;
+                i = (i + 1) & mask;
+            }
+        }
+
+        void release_table() noexcept {
+            std::vector<Entry>().swap(table);
+            std::vector<UserId>().swap(names);
+        }
+    };
+
+    struct Endpoint {
+        UserId key;
+        uint32_t hash;
+        uint32_t local_ep;
+    };
+    static_assert(sizeof(Endpoint) == 16);
+    static constexpr size_t kEpCap = ThreadBlockArena::kBlockBytes / sizeof(Endpoint);
+
+    LinkTable(size_t num_shards, size_t max_link_threads)
+        : shard_shift_(64u - static_cast<unsigned>(std::countr_zero(num_shards))),
+          parts_(num_shards),
+          arenas_(std::max<size_t>(1, max_link_threads)) {}
+
+    size_t num_arenas() const noexcept { return arenas_.size(); }
+    OverflowArena& arena(size_t i) noexcept { return arenas_[i]; }
+    const OverflowArena& arena(size_t i) const noexcept { return arenas_[i]; }
+    Partition& part(size_t s) noexcept { return parts_[s]; }
+    const Partition& part(size_t s) const noexcept { return parts_[s]; }
+    uint32_t total_linked() const noexcept { return total_linked_; }
+    const std::vector<LinkedRoot>& linked_roots() const noexcept { return linked_roots_; }
+    uint32_t next_alias(uint32_t lid) const noexcept { return next_alias_[lid]; }
+
+    // Prepare overlapped multi-thread link build state BEFORE Phase A's pool.run().
+    // Returns the number of Phase A workers (tid 0..n_link-1) that will build links
+    // before immediately joining events scanning!
+    size_t prepare_overlapped(std::vector<PreadFile>& files, size_t ncpu) {
+        files_ = &files;
+        chunks_ = build_pread_chunks(files, size_t(64) << 10);
+        if (chunks_.empty()) {
+            n_workers_ = 0;
+            return 0;
+        }
+        size_t nw = 1;
+        if (ncpu >= 6 && chunks_.size() >= 8) nw = 4;
+        else if (ncpu >= 3 && chunks_.size() >= 2) nw = 2;
+        nw = std::min(nw, arenas_.size());
+        n_workers_ = nw;
+
+        shard_eps_.assign(nw, std::vector<std::vector<BlockSlice<Endpoint>>>(parts_.size()));
+        thread_ep_cnt_.assign(nw, 0);
+        thread_ep_base_.assign(nw, 0);
+        next_chunk_.store(0, std::memory_order_relaxed);
+        read_done_.store(0, std::memory_order_relaxed);
+        stage1_ready_.store(0, std::memory_order_relaxed);
+        next_shard_.store(0, std::memory_order_relaxed);
+        global_id_.store(0, std::memory_order_relaxed);
+        intern_done_.store(0, std::memory_order_relaxed);
+        return nw;
+    }
+
+    // Called inside Phase A's pool.run() ONLY by tid < n_workers_.
+    // Stage 1 (all n_workers): parallel read + shard links CSVs.
+    // Stage 2 (all n_workers): parallel per-shard interning + edge assembly.
+    //   -> tid 1..n_workers-1 return IMMEDIATELY after Stage 2 to scan events!
+    // Stage 3 (tid 0 only): zero-atomic flat Union-Find + canonical min_node + next_alias_.
+    //   -> tid 0 returns immediately after Stage 3 to join events!
+    void run_overlapped_worker(size_t tid, ThreadBlockArena& my_arena,
+                               const OverflowArena* const* arenas, uint16_t link_aid_base,
+                               bool use_avx512) {
+        const size_t nw = n_workers_;
+        const size_t nshards = parts_.size();
+        const unsigned shift = shard_shift_;
+        const uint16_t my_aid = static_cast<uint16_t>(link_aid_base + tid);
+        OverflowArena& my_str = arenas_[tid];
+
+        // Stage 1: Read & shard links chunks.
+        {
+            struct EpOut {
+                Endpoint* cur = nullptr;
+                Endpoint* end = nullptr;
+            };
+            std::vector<EpOut> eout(nshards);
+            auto& my_eps = shard_eps_[tid];
+            uint32_t local_ep = 0;
+
+            auto push_ep = [&](size_t s, const Endpoint& ep) __attribute__((always_inline)) {
+                EpOut& o = eout[s];
+                if (__builtin_expect(o.cur == o.end, 0)) {
+                    if (o.cur != nullptr) {
+                        my_eps[s].push_back(BlockSlice<Endpoint>{o.cur - kEpCap,
+                                                                 static_cast<uint32_t>(kEpCap)});
+                    }
+                    Endpoint* blk = static_cast<Endpoint*>(my_arena.alloc());
+                    o.cur = blk;
+                    o.end = blk + kEpCap;
+                }
+                *o.cur++ = ep;
             };
 
-            for (const auto& worker : endpoints) {
-                for (size_t i = 0; i < worker.size(); i += 2) {
-                    const uint32_t ea = worker[i];
-                    const uint32_t eb = worker[i + 1];
-                    uint32_t ra = find(shard_base[ea >> 26] + (ea & ((1u << 26) - 1u)));
-                    uint32_t rb = find(shard_base[eb >> 26] + (eb & ((1u << 26) - 1u)));
-                    if (ra == rb) continue;
-                    if (rank[ra] < rank[rb]) std::swap(ra, rb);
-                    parent[rb] = ra;
-                    if (rank[ra] == rank[rb]) ++rank[ra];
-                }
-            }
-
-            std::vector<uint32_t> min_node(num_nodes);
-            for (uint32_t i = 0; i < num_nodes; ++i) min_node[i] = i;
-            for (uint32_t i = 0; i < num_nodes; ++i) {
-                const uint32_t r = find(i);
-                parent[i] = r;
-                if (i != min_node[r] &&
-                    UserId64::less(nodes[i], nodes[min_node[r]], all_user_arenas)) {
-                    min_node[r] = i;
-                }
-            }
-
-            for (size_t s = 0; s < kShards; ++s) {
-                const uint32_t lo = shard_base[s];
-                const uint32_t hi = (s + 1 < kShards) ? shard_base[s + 1] : num_nodes;
-                size_t sn = 0;
-                for (uint32_t i = lo; i < hi; ++i) {
-                    const uint32_t c = min_node[parent[i]];
-                    canon_idx[i] = c;
-                    if (c != i) ++sn;
-                }
-                shard_non_id[s] = sn;
-            }
-        } else {
-            auto parent = std::make_unique_for_overwrite<std::atomic<uint32_t>[]>(num_nodes);
-            auto min_node = std::make_unique_for_overwrite<std::atomic<uint32_t>[]>(num_nodes);
-
-            pool.run([&](size_t tid) {
-                const uint32_t lo = static_cast<uint32_t>((uint64_t(num_nodes) * tid) / ncpu);
-                const uint32_t hi = static_cast<uint32_t>((uint64_t(num_nodes) * (tid + 1)) / ncpu);
-                for (uint32_t i = lo; i < hi; ++i) {
-                    parent[i].store(i, std::memory_order_relaxed);
-                    min_node[i].store(i, std::memory_order_relaxed);
-                }
-            });
-
-            struct EdgeChunk {
-                const uint32_t* ptr;
-                size_t count;
+            auto on_row_impl = [&](const std::string_view (&f)[2],
+                                   auto padded_tag) __attribute__((always_inline)) {
+                constexpr bool pad = decltype(padded_tag)::value;
+                if (__builtin_expect(f[0].empty() || f[1].empty(), 0)) return;
+                const UserId a = pad ? UserId::make_str_padded(f[0], my_aid, my_str)
+                                     : UserId::make_str_safe(f[0], my_aid, my_str);
+                const UserId b = pad ? UserId::make_str_padded(f[1], my_aid, my_str)
+                                     : UserId::make_str_safe(f[1], my_aid, my_str);
+                if (__builtin_expect(a.raw == b.raw && a.is_inline(), 0)) return;
+                const uint64_t ha = a.hash(arenas);
+                const uint64_t hb = b.hash(arenas);
+                const uint32_t ep0 = local_ep;
+                local_ep += 2;
+                push_ep(static_cast<size_t>(ha >> shift),
+                        Endpoint{a, static_cast<uint32_t>(ha), ep0});
+                push_ep(static_cast<size_t>(hb >> shift),
+                        Endpoint{b, static_cast<uint32_t>(hb), ep0 + 1});
             };
-            std::vector<EdgeChunk> edge_chunks;
-            for (const auto& w : endpoints) {
-                for (size_t pos = 0; pos < w.size(); pos += 8192) {
-                    edge_chunks.push_back(
-                        EdgeChunk{w.data() + pos, std::min<size_t>(8192, w.size() - pos)});
+
+            auto on_fast = [&](const std::string_view (&f)[2]) __attribute__((always_inline)) {
+                on_row_impl(f, std::true_type{});
+            };
+            auto on_slow = [&](const std::string_view (&f)[2]) {
+                on_row_impl(f, std::false_type{});
+            };
+
+            RawBuf buf;
+            PreadView view;
+            const auto& files = *files_;
+            for (;;) {
+                const size_t ci = next_chunk_.fetch_add(1, std::memory_order_relaxed);
+                if (ci >= chunks_.size()) break;
+                const PreadChunk& pc = chunks_[ci];
+                if (!read_chunk_into(files[pc.file_idx], pc, buf, view)) continue;
+                if (use_avx512) {
+                    csv_simd::scan_pread_buf_avx512<2>(view, on_fast, on_slow);
+                } else {
+                    csv_simd::scan_pread_buf_avx2<2>(view, on_fast, on_slow);
                 }
             }
 
-            {
-                std::atomic<size_t> next_ec{0};
-                pool.run([&](size_t) {
-                    auto unite = [&](uint32_t u, uint32_t v) {
-                        for (;;) {
-                            for (;;) {
-                                const uint32_t pu = parent[u].load(std::memory_order_relaxed);
-                                if (pu == u) break;
-                                const uint32_t ppu = parent[pu].load(std::memory_order_relaxed);
-                                if (pu != ppu) {
-                                    uint32_t exp = pu;
-                                    parent[u].compare_exchange_weak(exp, ppu,
-                                                                    std::memory_order_relaxed);
-                                }
-                                u = ppu;
-                            }
-                            for (;;) {
-                                const uint32_t pv = parent[v].load(std::memory_order_relaxed);
-                                if (pv == v) break;
-                                const uint32_t ppv = parent[pv].load(std::memory_order_relaxed);
-                                if (pv != ppv) {
-                                    uint32_t exp = pv;
-                                    parent[v].compare_exchange_weak(exp, ppv,
-                                                                    std::memory_order_relaxed);
-                                }
-                                v = ppv;
-                            }
-                            if (u == v) return;
-                            if (u > v) std::swap(u, v);
-                            uint32_t expected = v;
-                            if (parent[v].compare_exchange_weak(expected, u,
-                                                                std::memory_order_relaxed)) {
-                                return;
-                            }
-                        }
-                    };
-
-                    for (;;) {
-                        const size_t ci = next_ec.fetch_add(1, std::memory_order_relaxed);
-                        if (ci >= edge_chunks.size()) break;
-                        const uint32_t* ep = edge_chunks[ci].ptr;
-                        const size_t n = edge_chunks[ci].count;
-                        for (size_t i = 0; i < n; i += 2) {
-                            const uint32_t ea = ep[i];
-                            const uint32_t eb = ep[i + 1];
-                            unite(shard_base[ea >> 26] + (ea & ((1u << 26) - 1u)),
-                                  shard_base[eb >> 26] + (eb & ((1u << 26) - 1u)));
-                        }
-                    }
-                });
+            for (size_t s = 0; s < nshards; ++s) {
+                if (eout[s].cur != nullptr) {
+                    Endpoint* base = eout[s].end - kEpCap;
+                    const uint32_t len = static_cast<uint32_t>(eout[s].cur - base);
+                    if (len > 0) my_eps[s].push_back(BlockSlice<Endpoint>{base, len});
+                }
             }
-
-            pool.run([&](size_t tid) {
-                const uint32_t lo = static_cast<uint32_t>((uint64_t(num_nodes) * tid) / ncpu);
-                const uint32_t hi = static_cast<uint32_t>((uint64_t(num_nodes) * (tid + 1)) / ncpu);
-                for (uint32_t i = lo; i < hi; ++i) {
-                    uint32_t r = i;
-                    for (;;) {
-                        const uint32_t p = parent[r].load(std::memory_order_relaxed);
-                        if (p == r) break;
-                        r = p;
-                    }
-                    canon_idx[i] = r;
-                    uint32_t cur = min_node[r].load(std::memory_order_relaxed);
-                    while (i != cur &&
-                           UserId64::less(nodes[i], nodes[cur], all_user_arenas)) {
-                        if (min_node[r].compare_exchange_weak(cur, i, std::memory_order_relaxed)) {
-                            break;
-                        }
-                    }
-                }
-            });
-
-            std::atomic<size_t> next_s{0};
-            pool.run([&](size_t) {
-                for (;;) {
-                    const size_t s = next_s.fetch_add(1, std::memory_order_relaxed);
-                    if (s >= kShards) break;
-                    const uint32_t lo = shard_base[s];
-                    const uint32_t hi = (s + 1 < kShards) ? shard_base[s + 1] : num_nodes;
-                    size_t sn = 0;
-                    for (uint32_t i = lo; i < hi; ++i) {
-                        const uint32_t c = min_node[canon_idx[i]].load(std::memory_order_relaxed);
-                        canon_idx[i] = c;
-                        if (c != i) ++sn;
-                    }
-                    shard_non_id[s] = sn;
-                }
-            });
+            thread_ep_cnt_[tid] = local_ep;
         }
 
-        std::vector<std::vector<uint32_t>>().swap(endpoints);
-        size_t non_id_count = 0;
-        size_t max_sn = 0;
-        for (size_t s = 0; s < kShards; ++s) {
-            non_id_count += shard_non_id[s];
-            if (shard_non_id[s] > max_sn) max_sn = shard_non_id[s];
-        }
-        if (non_id_count == 0) return;
-        has_links_ = true;
-
-        auto log2_p2 = [](size_t v) -> unsigned {
-            unsigned r = 0;
-            while ((size_t(1) << r) < v) ++r;
-            return r;
-        };
-
-        size_t sub_bloom_words = 64;
-        while (sub_bloom_words * 4 < max_sn) sub_bloom_words <<= 1;
-        sub_bloom_bits_ = log2_p2(sub_bloom_words);
-        sub_bloom_mask_ = sub_bloom_words - 1;
-        bloom_.assign_zero(kShards << sub_bloom_bits_);
-
-        size_t sub_slot_cap = 16;
-        while (sub_slot_cap * 82 < max_sn * 100) sub_slot_cap <<= 1;
-        sub_slot_bits_ = log2_p2(sub_slot_cap);
-        sub_slot_mask_ = sub_slot_cap - 1;
-        slots_.assign_zero(kShards << sub_slot_bits_);
-
-        auto populate_shard = [&](size_t s) {
-            const uint32_t lo = shard_base[s];
-            const uint32_t hi = (s + 1 < kShards) ? shard_base[s + 1] : num_nodes;
-            const size_t b_base = s << sub_bloom_bits_;
-            const size_t s_base = s << sub_slot_bits_;
-            for (uint32_t i = lo; i < hi; ++i) {
-                const uint32_t c = canon_idx[i];
-                if (c == i) continue;
-                const UserId64 k = nodes[i];
-                const UserId64 v = nodes[c];
-                const uint64_t h = k.hash(all_user_arenas);
-                bloom_[b_base + (static_cast<size_t>(h) & sub_bloom_mask_)] |= bloom_bits(h);
-                size_t off = static_cast<size_t>(h) & sub_slot_mask_;
-                while (!slots_[s_base + off].key.empty()) off = (off + 1) & sub_slot_mask_;
-                slots_[s_base + off] = LinkSlot{k, v};
+        // Mini-barrier among the n_workers link threads; last arriver allocates edges_.
+        if (read_done_.fetch_add(1, std::memory_order_acq_rel) + 1 == nw) {
+            size_t tot_eps = 0;
+            for (size_t t = 0; t < nw; ++t) {
+                thread_ep_base_[t] = tot_eps;
+                tot_eps += thread_ep_cnt_[t];
             }
-        };
-
-        if (num_nodes < 8192 || ncpu == 1) {
-            for (size_t s = 0; s < kShards; ++s) populate_shard(s);
+            total_eps_ = tot_eps;
+            if (tot_eps > 0) {
+                edges_ = std::make_unique_for_overwrite<uint32_t[]>(tot_eps);
+            }
+            chunks_.clear();
+            stage1_ready_.store(1, std::memory_order_release);
+            stage1_ready_.notify_all();
         } else {
-            std::atomic<size_t> next_s{0};
-            pool.run([&](size_t) {
-                for (;;) {
-                    const size_t s = next_s.fetch_add(1, std::memory_order_relaxed);
-                    if (s >= kShards) break;
-                    populate_shard(s);
+            while (stage1_ready_.load(std::memory_order_acquire) == 0) {
+                stage1_ready_.wait(0, std::memory_order_relaxed);
+            }
+        }
+
+        if (total_eps_ == 0) return;
+
+        // Stage 2: Parallel per-shard L2-hot interning with 8-ahead prefetch!
+        {
+            struct EpLoc {
+                uint32_t global_ep;
+                uint32_t loc;
+            };
+            std::vector<EpLoc> tmp_ep_loc;
+            tmp_ep_loc.reserve(8192);
+            uint32_t* const ep_dst = edges_.get();
+
+            for (;;) {
+                const size_t s = next_shard_.fetch_add(1, std::memory_order_relaxed);
+                if (s >= nshards) break;
+
+                size_t tot = 0;
+                for (size_t t = 0; t < nw; ++t) {
+                    for (const auto& sl : shard_eps_[t][s]) tot += sl.len;
                 }
-            });
+                Partition& part = parts_[s];
+                if (tot == 0) {
+                    part.num_linked = 0;
+                    part.linked_base = 0;
+                    continue;
+                }
+                // Reserve ~tot/2 + 64 (leaves headroom for C1 unlinked users without rehashing).
+                part.reserve(tot / 2 + 64, arenas);
+                part.names.reserve(tot / 2 + 64);
+                size_t mask = part.table.size() - 1;
+                tmp_ep_loc.clear();
+
+                for (size_t t = 0; t < nw; ++t) {
+                    const uint32_t ep_base = static_cast<uint32_t>(thread_ep_base_[t]);
+                    for (auto sl : shard_eps_[t][s]) {
+                        const Endpoint* const ptr = sl.ptr;
+                        const uint32_t len = sl.len;
+                        for (uint32_t i = 0; i < len; ++i) {
+                            if (i + 8 < len) {
+                                __builtin_prefetch(&part.table[ptr[i + 8].hash & mask], 1, 1);
+                            }
+                            const Endpoint& ep = ptr[i];
+                            const uint32_t loc = part.intern_local(ep.key, ep.hash, arenas);
+                            mask = part.table.size() - 1;
+                            tmp_ep_loc.push_back(EpLoc{ep_base + ep.local_ep, loc});
+                        }
+                        my_arena.recycle(sl.ptr);
+                    }
+                    std::vector<BlockSlice<Endpoint>>().swap(shard_eps_[t][s]);
+                }
+
+                const uint32_t nloc = static_cast<uint32_t>(part.names.size());
+                const uint32_t gbase = global_id_.fetch_add(nloc, std::memory_order_relaxed);
+                part.num_linked = nloc;
+                part.linked_base = gbase;
+
+                for (const EpLoc& el : tmp_ep_loc) {
+                    ep_dst[el.global_ep] = gbase + el.loc;
+                }
+            }
         }
 
-        const auto lt4 = std::chrono::steady_clock::now();
-        auto ms = [](auto a, auto b) {
-            return std::chrono::duration<double, std::milli>(b - a).count();
+        // Workers tid 1..nw-1 signal completion and IMMEDIATELY return to scan events!
+        if (tid != 0) {
+            if (intern_done_.fetch_add(1, std::memory_order_acq_rel) + 1 == nw) {
+                intern_done_.notify_one();
+            }
+            return;
+        }
+
+        // tid 0 waits for remaining Stage 2 workers, then runs flat zero-atomic Union-Find.
+        intern_done_.fetch_add(1, std::memory_order_acq_rel);
+        for (;;) {
+            const size_t done = intern_done_.load(std::memory_order_acquire);
+            if (done >= nw) break;
+            intern_done_.wait(done, std::memory_order_relaxed);
+        }
+
+        total_linked_ = global_id_.load(std::memory_order_relaxed);
+        if (total_linked_ == 0) {
+            edges_.reset();
+            return;
+        }
+
+        // Stage 3: Flat zero-atomic Union-Find by rank with path halving.
+        const uint32_t N = total_linked_;
+        auto parent = std::make_unique_for_overwrite<uint32_t[]>(N);
+        auto rank = std::make_unique<uint8_t[]>(N);
+        for (uint32_t i = 0; i < N; ++i) parent[i] = i;
+
+        auto find = [&](uint32_t x) noexcept -> uint32_t {
+            while (parent[x] != x) {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            return x;
         };
-        std::fprintf(stderr,
-                     "links breakdown: read=%.1f shard=%.1f flatten=%.1f uf+tbl=%.1f | "
-                     "nodes=%u non_id=%zu slots=%.1fMB bloom=%.1fMB\n",
-                     ms(lt0, lt1), ms(lt1, lt2), ms(lt2, lt3), ms(lt3, lt4), num_nodes,
-                     non_id_count, slots_.size() * 16.0 / (1024.0 * 1024.0),
-                     bloom_.size() * 8.0 / (1024.0 * 1024.0));
-    }
 
-    bool empty() const noexcept { return !has_links_; }
-
-    [[gnu::always_inline]] inline void prefetch_bloom(uint64_t h) const noexcept {
-        const size_t s = static_cast<size_t>(h >> kShardShift);
-        __builtin_prefetch(
-            &bloom_[(s << sub_bloom_bits_) | (static_cast<size_t>(h) & sub_bloom_mask_)], 0, 1);
-    }
-
-    [[gnu::always_inline]] inline bool may_contain(uint64_t h) const noexcept {
-        const size_t s = static_cast<size_t>(h >> kShardShift);
-        const uint64_t w =
-            bloom_[(s << sub_bloom_bits_) | (static_cast<size_t>(h) & sub_bloom_mask_)];
-        const uint64_t b = bloom_bits(h);
-        return (w & b) == b;
-    }
-
-    [[gnu::always_inline]] inline void prefetch_slot(uint64_t h) const noexcept {
-        const size_t s = static_cast<size_t>(h >> kShardShift);
-        __builtin_prefetch(
-            &slots_[(s << sub_slot_bits_) | (static_cast<size_t>(h) & sub_slot_mask_)], 0, 1);
-    }
-
-    [[gnu::always_inline]] inline bool resolve_with_hash(
-        UserId64 key, uint64_t h, UserId64& out_canon,
-        const OverflowArena* const* all_user_arenas) const noexcept {
-        const size_t base = static_cast<size_t>(h >> kShardShift) << sub_slot_bits_;
-        size_t off = static_cast<size_t>(h) & sub_slot_mask_;
-        for (;;) {
-            const LinkSlot& sl = slots_[base + off];
-            if (sl.key.raw == 0) return false;
-            if (UserId64::equals(sl.key, key, all_user_arenas)) {
-                out_canon = sl.canon;
-                return true;
-            }
-            off = (off + 1) & sub_slot_mask_;
+        const uint32_t* ep_ptr = edges_.get();
+        const size_t nedges = total_eps_;
+        for (size_t i = 0; i < nedges; i += 2) {
+            uint32_t ra = find(ep_ptr[i]);
+            uint32_t rb = find(ep_ptr[i + 1]);
+            if (ra == rb) continue;
+            if (rank[ra] < rank[rb]) std::swap(ra, rb);
+            parent[rb] = ra;
+            if (rank[ra] == rank[rb]) ++rank[ra];
         }
-    }
+        edges_.reset();
+        rank.reset();
 
-    [[gnu::always_inline]] inline bool resolve_sv_with_hash(
-        std::string_view sv, uint64_t h, UserId64& out_canon,
-        const OverflowArena* const* all_user_arenas) const noexcept {
-        const size_t base = static_cast<size_t>(h >> kShardShift) << sub_slot_bits_;
-        size_t off = static_cast<size_t>(h) & sub_slot_mask_;
-        for (;;) {
-            const LinkSlot& sl = slots_[base + off];
-            if (sl.key.raw == 0) return false;
-            if (UserId64::equals_sv(sl.key, sv, all_user_arenas)) {
-                out_canon = sl.canon;
-                return true;
+        // Flatten names for cache-friendly canonical min_node selection.
+        auto all_names = std::make_unique_for_overwrite<UserId[]>(N);
+        for (size_t s = 0; s < nshards; ++s) {
+            const Partition& part = parts_[s];
+            if (part.num_linked > 0) {
+                std::memcpy(all_names.get() + part.linked_base, part.names.data(),
+                            part.num_linked * sizeof(UserId));
             }
-            off = (off + 1) & sub_slot_mask_;
         }
+
+        auto min_node = std::make_unique_for_overwrite<uint32_t[]>(N);
+        for (uint32_t i = 0; i < N; ++i) min_node[i] = i;
+        for (uint32_t i = 0; i < N; ++i) {
+            uint32_t r = i;
+            while (parent[r] != r) r = parent[r];
+            parent[i] = r;
+            const uint32_t cur = min_node[r];
+            if (i != cur && UserId::less(all_names[i], all_names[cur], arenas)) {
+                min_node[r] = i;
+            }
+        }
+
+        // Build compact flat linked_roots_ and next_alias_ list.
+        next_alias_ = std::make_unique_for_overwrite<uint32_t[]>(N);
+        std::memset(next_alias_.get(), 0xFF, N * sizeof(uint32_t));
+        linked_roots_.reserve(N / 2);
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint32_t c = min_node[parent[i]];
+            if (c == i) {
+                linked_roots_.push_back(LinkedRoot{all_names[i], i, 0});
+            } else {
+                next_alias_[i] = next_alias_[c];
+                next_alias_[c] = i;
+            }
+        }
+        std::vector<std::vector<std::vector<BlockSlice<Endpoint>>>>().swap(shard_eps_);
     }
 
    private:
-    [[gnu::always_inline]] static inline uint64_t bloom_bits(uint64_t h) noexcept {
-        return (1ULL << ((h >> 24) & 63u)) | (1ULL << ((h >> 30) & 63u)) |
-               (1ULL << ((h >> 36) & 63u));
-    }
+    unsigned shard_shift_;
+    std::vector<Partition> parts_;
+    std::vector<OverflowArena> arenas_;
+    uint32_t total_linked_ = 0;
+    std::vector<LinkedRoot> linked_roots_;
+    std::unique_ptr<uint32_t[]> next_alias_;
 
-    OverflowArena node_arenas_[kShards];
-    HugeBuffer<uint64_t> bloom_;
-    HugeBuffer<LinkSlot> slots_;
-    size_t sub_bloom_mask_ = 0;
-    size_t sub_slot_mask_ = 0;
-    unsigned sub_bloom_bits_ = 0;
-    unsigned sub_slot_bits_ = 0;
-    bool has_links_ = false;
+    // Overlapped build state
+    std::vector<PreadFile>* files_ = nullptr;
+    std::vector<PreadChunk> chunks_;
+    size_t n_workers_ = 0;
+    std::vector<std::vector<std::vector<BlockSlice<Endpoint>>>> shard_eps_;
+    std::vector<size_t> thread_ep_cnt_;
+    std::vector<size_t> thread_ep_base_;
+    size_t total_eps_ = 0;
+    std::unique_ptr<uint32_t[]> edges_;
+    std::atomic<size_t> next_chunk_{0};
+    std::atomic<size_t> read_done_{0};
+    std::atomic<uint32_t> stage1_ready_{0};
+    std::atomic<size_t> next_shard_{0};
+    std::atomic<uint32_t> global_id_{0};
+    std::atomic<size_t> intern_done_{0};
 };

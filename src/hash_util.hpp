@@ -10,18 +10,18 @@
 #include <utility>
 #include <vector>
 
-inline uint64_t wyhash_mix(uint64_t a, uint64_t b) noexcept {
+[[gnu::always_inline]] inline uint64_t wyhash_mix(uint64_t a, uint64_t b) noexcept {
     __uint128_t r = static_cast<__uint128_t>(a) * static_cast<__uint128_t>(b);
     return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
 }
 
-inline uint64_t wyhash_read8(const char* p) noexcept {
+[[gnu::always_inline]] inline uint64_t wyhash_read8(const char* p) noexcept {
     uint64_t v;
     std::memcpy(&v, p, 8);
     return v;
 }
 
-inline uint64_t wyhash_read4(const char* p) noexcept {
+[[gnu::always_inline]] inline uint64_t wyhash_read4(const char* p) noexcept {
     uint32_t v;
     std::memcpy(&v, p, 4);
     return v;
@@ -169,10 +169,10 @@ class HugeBuffer {
     size_t mapped_bytes_ = 0;
 };
 
-// Lock-free per-thread 64 KB block allocator backed by 2MB-aligned THP mmap slabs.
+// Per-worker lock-free 16 KiB block allocator backed by 2 MiB-aligned THP slabs.
 class ThreadBlockArena {
    public:
-    static constexpr size_t kBlockBytes = 65536;
+    static constexpr size_t kBlockBytes = 16384;
 
     ThreadBlockArena() = default;
     ThreadBlockArena(const ThreadBlockArena&) = delete;
@@ -267,6 +267,78 @@ class ThreadBlockArena {
     size_t next_slab_bytes_ = size_t(4) << 20;
 };
 
+// Per-thread THP bump allocator for cross-barrier C1->C2 linked shard slabs (zero 4-KB page faults).
+class HugeBumpArena {
+   public:
+    HugeBumpArena() = default;
+    HugeBumpArena(const HugeBumpArena&) = delete;
+    HugeBumpArena& operator=(const HugeBumpArena&) = delete;
+    HugeBumpArena(HugeBumpArena&& o) noexcept
+        : slabs_(std::move(o.slabs_)), cur_(o.cur_), end_(o.end_) {
+        o.cur_ = nullptr;
+        o.end_ = nullptr;
+    }
+    HugeBumpArena& operator=(HugeBumpArena&& o) noexcept {
+        if (this != &o) {
+            release_all();
+            slabs_ = std::move(o.slabs_);
+            cur_ = o.cur_;
+            end_ = o.end_;
+            o.cur_ = nullptr;
+            o.end_ = nullptr;
+        }
+        return *this;
+    }
+    ~HugeBumpArena() { release_all(); }
+
+    template <typename T>
+    T* alloc(size_t count) {
+        if (count == 0) return nullptr;
+        const size_t bytes = ((count * sizeof(T)) + 63u) & ~size_t(63u);
+        if (__builtin_expect(static_cast<size_t>(end_ - cur_) < bytes, 0)) {
+            alloc_slab(bytes);
+        }
+        T* p = reinterpret_cast<T*>(cur_);
+        cur_ += bytes;
+        return p;
+    }
+
+    void release_all() noexcept {
+        for (const auto& s : slabs_) ::munmap(s.ptr, s.bytes);
+        std::vector<Slab>().swap(slabs_);
+        cur_ = nullptr;
+        end_ = nullptr;
+    }
+
+   private:
+    struct Slab {
+        void* ptr;
+        size_t bytes;
+    };
+
+    __attribute__((noinline)) void alloc_slab(size_t min_bytes) {
+        constexpr size_t kHuge = size_t(2) << 20;
+        const size_t slab_bytes = std::max<size_t>(size_t(8) << 20, (min_bytes + kHuge - 1) & ~(kHuge - 1));
+        const size_t map_sz = slab_bytes + kHuge;
+        void* raw = ::mmap(nullptr, map_sz, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED) throw std::bad_alloc();
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
+        const uintptr_t aligned = (addr + kHuge - 1) & ~(uintptr_t(kHuge) - 1);
+        if (aligned > addr) ::munmap(raw, aligned - addr);
+        const size_t tail = (addr + map_sz) - (aligned + slab_bytes);
+        if (tail > 0) ::munmap(reinterpret_cast<void*>(aligned + slab_bytes), tail);
+        ::madvise(reinterpret_cast<void*>(aligned), slab_bytes, MADV_HUGEPAGE);
+        slabs_.push_back(Slab{reinterpret_cast<void*>(aligned), slab_bytes});
+        cur_ = reinterpret_cast<char*>(aligned);
+        end_ = cur_ + slab_bytes;
+    }
+
+    std::vector<Slab> slabs_;
+    char* cur_ = nullptr;
+    char* end_ = nullptr;
+};
+
 template <typename T>
 struct BlockSlice {
     T* ptr;
@@ -334,7 +406,7 @@ struct OverflowArena {
         return std::string_view(blocks[off >> BLOCK_SHIFT] + (off & BLOCK_MASK), len);
     }
 
-    uint64_t push_with_len(std::string_view sv) {
+    [[gnu::noinline]] uint64_t push_with_len(std::string_view sv) {
         const uint32_t len = static_cast<uint32_t>(sv.size());
         const size_t need = 4 + static_cast<size_t>(len);
         if (need > BLOCK_SIZE) {
@@ -368,37 +440,31 @@ struct OverflowArena {
 };
 
 // 8-byte compact ID optimized for "<Prefix><1..8 ASCII bytes>" (bit 63 == 0) with overflow fallback.
-// 0 == empty sentinel.
+// 0 == empty sentinel. All hot paths are [[gnu::always_inline]]; all overflow paths are [[gnu::noinline]].
 template <char Prefix>
 struct FastId64 {
-    static constexpr uint64_t kLenMask[9] = {
-        0x0000000000000000ULL,
-        0x00000000000000FFULL,
-        0x000000000000FFFFULL,
-        0x0000000000FFFFFFULL,
-        0x00000000FFFFFFFFULL,
-        0x000000FFFFFFFFFFULL,
-        0x0000FFFFFFFFFFFFULL,
-        0x00FFFFFFFFFFFFFFULL,
-        0xFFFFFFFFFFFFFFFFULL,
-    };
-
     uint64_t raw = 0;
 
-    static inline uint64_t check_inline_word(uint64_t w, size_t len) noexcept {
-        const uint64_t m = kLenMask[len - 1];
+    [[gnu::always_inline]] static inline uint64_t check_inline_word(uint64_t w,
+                                                                    size_t len) noexcept {
+        const uint64_t m = (~0ULL) >> ((9u - static_cast<unsigned>(len)) << 3);
         w &= m;
         const uint64_t active = w | ~m;
-        const uint64_t has_zero =
-            (active - 0x0101010101010101ULL) & ~active & 0x8080808080808080ULL;
-        if (__builtin_expect(((w & 0x8080808080808080ULL) | has_zero) == 0, 1)) {
-            return w;
-        }
-        return 0;
+        const uint64_t bad =
+            (w | ((active - 0x0101010101010101ULL) & ~active)) & 0x8080808080808080ULL;
+        return __builtin_expect(bad == 0, 1) ? w : 0ULL;
     }
 
     // Caller guarantees at least 9 readable bytes starting at p.
-    static inline FastId64 try_inline_padded(const char* p, size_t len) noexcept {
+    [[gnu::always_inline]] static inline FastId64 try_inline_padded(const char* p,
+                                                                    size_t len) noexcept {
+        if (__builtin_expect(len == 9 && p[0] == Prefix, 1)) {
+            uint64_t w;
+            std::memcpy(&w, p + 1, 8);
+            const uint64_t bad =
+                (w | ((w - 0x0101010101010101ULL) & ~w)) & 0x8080808080808080ULL;
+            return __builtin_expect(bad == 0, 1) ? FastId64{w} : FastId64{0};
+        }
         if (__builtin_expect(len - 2 <= 7 && p[0] == Prefix, 1)) {
             uint64_t w;
             std::memcpy(&w, p + 1, 8);
@@ -407,7 +473,7 @@ struct FastId64 {
         return FastId64{0};
     }
 
-    static inline FastId64 try_inline_safe(std::string_view sv) noexcept {
+    [[gnu::always_inline]] static inline FastId64 try_inline_safe(std::string_view sv) noexcept {
         const size_t len = sv.size();
         if (__builtin_expect(len - 2 <= 7 && sv[0] == Prefix, 1)) {
             uint64_t w = 0;
@@ -417,53 +483,57 @@ struct FastId64 {
         return FastId64{0};
     }
 
-    static inline FastId64 make_overflow(std::string_view sv, uint16_t arena_id,
-                                         OverflowArena& arena) {
+    [[gnu::noinline]] static FastId64 make_overflow(std::string_view sv, uint16_t arena_id,
+                                                    OverflowArena& arena) {
         const uint64_t off = arena.push_with_len(sv);
         return FastId64{(1ULL << 63) | (static_cast<uint64_t>(arena_id & 0x7FFFu) << 48) |
                         (off & 0x0000FFFFFFFFFFFFULL)};
     }
 
     // Caller guarantees at least 9 readable bytes at sv.data().
-    static inline FastId64 make_str_padded(std::string_view sv, uint16_t arena_id,
-                                           OverflowArena& arena) {
+    [[gnu::always_inline]] static inline FastId64 make_str_padded(std::string_view sv,
+                                                                  uint16_t arena_id,
+                                                                  OverflowArena& arena) {
         FastId64 id = try_inline_padded(sv.data(), sv.size());
         if (__builtin_expect(id.raw != 0, 1)) return id;
         return make_overflow(sv, arena_id, arena);
     }
 
-    static inline FastId64 make_str_safe(std::string_view sv, uint16_t arena_id,
-                                         OverflowArena& arena) {
+    [[gnu::always_inline]] static inline FastId64 make_str_safe(std::string_view sv,
+                                                                uint16_t arena_id,
+                                                                OverflowArena& arena) {
         FastId64 id = try_inline_safe(sv);
         if (__builtin_expect(id.raw != 0, 1)) return id;
         return make_overflow(sv, arena_id, arena);
     }
 
-    inline bool empty() const noexcept { return raw == 0; }
-    inline bool is_inline() const noexcept { return (raw >> 63) == 0 && raw != 0; }
-    inline bool is_overflow() const noexcept { return (raw >> 63) != 0; }
+    [[gnu::always_inline]] inline bool empty() const noexcept { return raw == 0; }
+    [[gnu::always_inline]] inline bool is_inline() const noexcept {
+        return (raw >> 63) == 0 && raw != 0;
+    }
+    [[gnu::always_inline]] inline bool is_overflow() const noexcept { return (raw >> 63) != 0; }
 
-    inline uint16_t overflow_arena_id() const noexcept {
+    [[gnu::always_inline]] inline uint16_t overflow_arena_id() const noexcept {
         return static_cast<uint16_t>((raw >> 48) & 0x7FFFu);
     }
 
-    inline uint64_t overflow_off() const noexcept {
+    [[gnu::always_inline]] inline uint64_t overflow_off() const noexcept {
         return raw & 0x0000FFFFFFFFFFFFULL;
     }
 
-    inline uint32_t inline_len() const noexcept {
+    [[gnu::always_inline]] inline uint32_t inline_len() const noexcept {
         return 9u - (static_cast<unsigned>(__builtin_clzll(raw)) >> 3);
     }
 
     // Caller guarantees dst has at least 16 writable bytes.
-    inline uint32_t write_inline_to(char* dst) const noexcept {
+    [[gnu::always_inline]] inline uint32_t write_inline_to(char* dst) const noexcept {
         dst[0] = Prefix;
         std::memcpy(dst + 1, &raw, 8);
         return inline_len();
     }
 
-    inline std::string_view view(const OverflowArena* const* arenas,
-                                 char (&scratch)[9]) const noexcept {
+    [[gnu::always_inline]] inline std::string_view view(const OverflowArena* const* arenas,
+                                                        char (&scratch)[9]) const noexcept {
         if (__builtin_expect(is_inline(), 1)) {
             scratch[0] = Prefix;
             std::memcpy(scratch + 1, &raw, 8);
@@ -473,67 +543,52 @@ struct FastId64 {
         return arenas[overflow_arena_id()]->get_len_str(overflow_off());
     }
 
-    inline uint64_t hash(const OverflowArena* const* arenas) const noexcept {
-        if (__builtin_expect((raw >> 63) == 0, 1)) {
-            const uint64_t h = wyhash_mix(raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
-            return h ? h : 1;
-        }
-        const uint64_t h = wyhash64(arenas[overflow_arena_id()]->get_len_str(overflow_off()));
-        return h ? h : 1;
+    [[gnu::noinline]] uint64_t hash_overflow(const OverflowArena* const* arenas) const noexcept {
+        return wyhash64(arenas[overflow_arena_id()]->get_len_str(overflow_off()));
     }
 
-    static inline uint64_t hash_sv(std::string_view sv) noexcept {
+    [[gnu::always_inline]] inline uint64_t hash(const OverflowArena* const* arenas) const noexcept {
+        if (__builtin_expect((raw >> 63) == 0, 1)) {
+            return wyhash_mix(raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
+        }
+        return hash_overflow(arenas);
+    }
+
+    [[gnu::always_inline]] static inline uint64_t hash_sv(std::string_view sv) noexcept {
         FastId64 id = try_inline_safe(sv);
         if (__builtin_expect(id.raw != 0, 1)) {
-            const uint64_t h =
-                wyhash_mix(id.raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
-            return h ? h : 1;
+            return wyhash_mix(id.raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
         }
-        const uint64_t h = wyhash64(sv);
-        return h ? h : 1;
+        return wyhash64(sv);
     }
 
-    // Caller guarantees at least 9 readable bytes at sv.data().
-    static inline uint64_t hash_sv_padded(std::string_view sv) noexcept {
-        FastId64 id = try_inline_padded(sv.data(), sv.size());
-        if (__builtin_expect(id.raw != 0, 1)) {
-            const uint64_t h =
-                wyhash_mix(id.raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
-            return h ? h : 1;
-        }
-        const uint64_t h = wyhash64(sv);
-        return h ? h : 1;
-    }
-
-    static inline bool equals(FastId64 a, FastId64 b,
-                              const OverflowArena* const* arenas) noexcept {
-        if (a.raw == b.raw) return true;
-        if (__builtin_expect(((a.raw & b.raw) >> 63) == 0, 1)) return false;
+    [[gnu::noinline]] static bool equals_overflow(FastId64 a, FastId64 b,
+                                                  const OverflowArena* const* arenas) noexcept {
         const std::string_view sa = arenas[a.overflow_arena_id()]->get_len_str(a.overflow_off());
         const std::string_view sb = arenas[b.overflow_arena_id()]->get_len_str(b.overflow_off());
         return sa.size() == sb.size() &&
                (sa.empty() || std::memcmp(sa.data(), sb.data(), sa.size()) == 0);
     }
 
-    static inline bool equals_sv(FastId64 a, std::string_view sv,
-                                 const OverflowArena* const* arenas) noexcept {
-        FastId64 b = try_inline_safe(sv);
-        if (__builtin_expect(b.raw != 0, 1)) {
-            return a.raw == b.raw;
-        }
-        if (__builtin_expect((a.raw >> 63) == 0, 1)) return false;
-        const std::string_view sa = arenas[a.overflow_arena_id()]->get_len_str(a.overflow_off());
-        return sa.size() == sv.size() &&
-               (sv.empty() || std::memcmp(sa.data(), sv.data(), sv.size()) == 0);
+    [[gnu::always_inline]] static inline bool equals(FastId64 a, FastId64 b,
+                                                     const OverflowArena* const* arenas) noexcept {
+        if (a.raw == b.raw) return true;
+        if (__builtin_expect(((a.raw & b.raw) >> 63) == 0, 1)) return false;
+        return equals_overflow(a, b, arenas);
     }
 
-    static inline bool less(FastId64 a, FastId64 b,
-                            const OverflowArena* const* arenas) noexcept {
+    [[gnu::noinline]] static bool less_overflow(FastId64 a, FastId64 b,
+                                                const OverflowArena* const* arenas) noexcept {
+        char sa_buf[9], sb_buf[9];
+        return byte_less(a.view(arenas, sa_buf), b.view(arenas, sb_buf));
+    }
+
+    [[gnu::always_inline]] static inline bool less(FastId64 a, FastId64 b,
+                                                   const OverflowArena* const* arenas) noexcept {
         if (__builtin_expect(((a.raw | b.raw) >> 63) == 0, 1)) {
             return __builtin_bswap64(a.raw) < __builtin_bswap64(b.raw);
         }
-        char sa_buf[9], sb_buf[9];
-        return byte_less(a.view(arenas, sa_buf), b.view(arenas, sb_buf));
+        return less_overflow(a, b, arenas);
     }
 
     bool operator==(const FastId64& o) const noexcept { return raw == o.raw; }

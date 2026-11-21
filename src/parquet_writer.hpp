@@ -1,12 +1,16 @@
 #pragma once
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 #include <vector>
 
 #include "hash_util.hpp"
@@ -103,11 +107,14 @@ class Buf {
 class FastByteCursor {
    public:
     explicit FastByteCursor(size_t initial_cap = 1 << 20)
-        : buf_(initial_cap), cur_(buf_.data()), end_(buf_.data() + buf_.size()) {}
+        : buf_(std::make_unique_for_overwrite<uint8_t[]>(initial_cap)),
+          cap_(initial_cap),
+          cur_(buf_.get()),
+          end_(buf_.get() + initial_cap) {}
 
-    void clear() noexcept { cur_ = buf_.data(); }
-    const uint8_t* data() const noexcept { return buf_.data(); }
-    size_t size() const noexcept { return static_cast<size_t>(cur_ - buf_.data()); }
+    void clear() noexcept { cur_ = buf_.get(); }
+    const uint8_t* data() const noexcept { return buf_.get(); }
+    size_t size() const noexcept { return static_cast<size_t>(cur_ - buf_.get()); }
 
     [[gnu::always_inline]] inline void write_len_str(std::string_view sv) {
         const uint32_t slen = static_cast<uint32_t>(sv.size());
@@ -139,15 +146,19 @@ class FastByteCursor {
 
    private:
     __attribute__((noinline)) void grow(size_t need) {
-        const size_t used = static_cast<size_t>(cur_ - buf_.data());
-        size_t ncap = buf_.size() * 2;
+        const size_t used = static_cast<size_t>(cur_ - buf_.get());
+        size_t ncap = cap_ * 2;
         while (ncap < used + need) ncap *= 2;
-        buf_.resize(ncap);
-        cur_ = buf_.data() + used;
-        end_ = buf_.data() + ncap;
+        auto nb = std::make_unique_for_overwrite<uint8_t[]>(ncap);
+        if (used > 0) std::memcpy(nb.get(), buf_.get(), used);
+        buf_ = std::move(nb);
+        cap_ = ncap;
+        cur_ = buf_.get() + used;
+        end_ = buf_.get() + ncap;
     }
 
-    std::vector<uint8_t> buf_;
+    std::unique_ptr<uint8_t[]> buf_;
+    size_t cap_;
     uint8_t* cur_;
     uint8_t* end_;
 };
@@ -176,15 +187,17 @@ struct ChunkMeta {
 
 class RawFile {
    public:
-    explicit RawFile(const std::string& path) : path_(path), io_buf_(1 << 20) {
-        fp_ = std::fopen(path.c_str(), "wb");
-        if (!fp_) throw std::runtime_error("cannot open output parquet: " + path);
-        std::setvbuf(fp_, io_buf_.data(), _IOFBF, io_buf_.size());
+    static constexpr size_t kSmallBufBytes = 65536;
+
+    explicit RawFile(const std::string& path)
+        : path_(path), io_buf_(std::make_unique_for_overwrite<char[]>(kSmallBufBytes)) {
+        fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_ < 0) throw std::runtime_error("cannot open output parquet: " + path);
         write_raw("PAR1", 4);
     }
 
     ~RawFile() {
-        if (fp_) std::fclose(fp_);
+        if (fd_ >= 0) ::close(fd_);
     }
 
     RawFile(const RawFile&) = delete;
@@ -194,26 +207,53 @@ class RawFile {
 
     void write_raw(const void* p, size_t n) {
         if (n == 0) return;
-        if (std::fwrite(p, 1, n, fp_) != n) {
-            throw std::runtime_error("parquet write failed: " + path_);
-        }
         offset_ += static_cast<int64_t>(n);
+        if (n >= 32768) {
+            flush_buf();
+            write_fd(p, n);
+            return;
+        }
+        if (buf_pos_ + n > kSmallBufBytes) {
+            flush_buf();
+        }
+        std::memcpy(io_buf_.get() + buf_pos_, p, n);
+        buf_pos_ += n;
     }
 
     void close_file() {
-        if (fp_) {
-            if (std::fflush(fp_) != 0 || std::fclose(fp_) != 0) {
-                fp_ = nullptr;
-                throw std::runtime_error("parquet close failed: " + path_);
-            }
-            fp_ = nullptr;
+        if (fd_ >= 0) {
+            flush_buf();
+            const int rc = ::close(fd_);
+            fd_ = -1;
+            if (rc != 0) throw std::runtime_error("parquet close failed: " + path_);
         }
     }
 
    private:
+    void write_fd(const void* p, size_t n) {
+        const char* cp = static_cast<const char*>(p);
+        size_t done = 0;
+        while (done < n) {
+            const ssize_t w = ::write(fd_, cp + done, n - done);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error("parquet write failed: " + path_);
+            }
+            done += static_cast<size_t>(w);
+        }
+    }
+
+    void flush_buf() {
+        if (buf_pos_ > 0) {
+            write_fd(io_buf_.get(), buf_pos_);
+            buf_pos_ = 0;
+        }
+    }
+
     std::string path_;
-    std::vector<char> io_buf_;
-    FILE* fp_ = nullptr;
+    std::unique_ptr<char[]> io_buf_;
+    size_t buf_pos_ = 0;
+    int fd_ = -1;
     int64_t offset_ = 0;
 };
 
@@ -387,11 +427,11 @@ class UserDailyParquetWriter {
         : file_(path),
           col_user_(2 << 20),
           vals_top_cat_(512 << 10),
-          col_day_(kRowGroupRows),
-          col_sessions_(kRowGroupRows),
-          col_events_(kRowGroupRows),
-          col_revenue_(kRowGroupRows),
-          def_top_cat_(kRowGroupRows) {}
+          col_day_(std::make_unique_for_overwrite<int32_t[]>(kRowGroupRows)),
+          col_sessions_(std::make_unique_for_overwrite<int32_t[]>(kRowGroupRows)),
+          col_events_(std::make_unique_for_overwrite<int32_t[]>(kRowGroupRows)),
+          col_revenue_(std::make_unique_for_overwrite<int64_t[]>(kRowGroupRows)),
+          def_top_cat_(std::make_unique_for_overwrite<uint8_t[]>(kRowGroupRows)) {}
 
     [[gnu::always_inline]] inline void add_row(FastId64<'u'> user_id,
                                                const OverflowArena* const* arenas, int32_t day,
@@ -453,13 +493,13 @@ class UserDailyParquetWriter {
         };
 
         emit_raw(6, "user_id", false, col_user_.data(), col_user_.size());
-        emit_raw(1, "day", false, col_day_.data(), nrows * 4);
-        emit_raw(1, "sessions", false, col_sessions_.data(), nrows * 4);
-        emit_raw(1, "events", false, col_events_.data(), nrows * 4);
-        emit_raw(2, "revenue_cents", false, col_revenue_.data(), nrows * 8);
+        emit_raw(1, "day", false, col_day_.get(), nrows * 4);
+        emit_raw(1, "sessions", false, col_sessions_.get(), nrows * 4);
+        emit_raw(1, "events", false, col_events_.get(), nrows * 4);
+        emit_raw(2, "revenue_cents", false, col_revenue_.get(), nrows * 8);
 
         def_buf_.clear();
-        parquet_detail::encode_def_levels_bit1(def_buf_, def_top_cat_.data(), nrows);
+        parquet_detail::encode_def_levels_bit1(def_buf_, def_top_cat_.get(), nrows);
         const size_t top_body_len = def_buf_.size() + vals_top_cat_.size();
         parquet_detail::write_page_header(hdr_tmp_, static_cast<int32_t>(top_body_len),
                                           static_cast<int32_t>(rg_rows_));
@@ -480,9 +520,9 @@ class UserDailyParquetWriter {
 
     parquet_detail::RawFile file_;
     parquet_detail::FastByteCursor col_user_, vals_top_cat_;
-    std::vector<int32_t> col_day_, col_sessions_, col_events_;
-    std::vector<int64_t> col_revenue_;
-    std::vector<uint8_t> def_top_cat_;
+    std::unique_ptr<int32_t[]> col_day_, col_sessions_, col_events_;
+    std::unique_ptr<int64_t[]> col_revenue_;
+    std::unique_ptr<uint8_t[]> def_top_cat_;
     parquet_detail::Buf def_buf_, hdr_tmp_;
     std::vector<parquet_detail::RowGroupRecord> rgs_;
     int64_t rg_rows_ = 0;
