@@ -498,11 +498,71 @@ template <size_t N>
     }
 }
 
+[[gnu::always_inline]] inline Delimiters delimiters32_avx2(const char* p) noexcept {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    return {static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(',')))),
+            static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('\n')))),
+            static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"'))))};
+}
+
+SS_AVX512_ATTR [[gnu::always_inline]] inline Delimiters delimiters32_avx512(const char* p) noexcept {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    return {static_cast<uint32_t>(_mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8(','))),
+            static_cast<uint32_t>(_mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8('\n'))),
+            static_cast<uint32_t>(_mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8('"')))};
+}
+
+SS_AVX512_ATTR [[gnu::always_inline]] inline size_t read_fields2_32_avx512(
+    const char* p, std::string_view* fields) noexcept {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    const uint32_t commas = static_cast<uint32_t>(_mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8(',')));
+    const uint32_t nls = static_cast<uint32_t>(_mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8('\n')));
+    const uint32_t seps = commas | nls;
+    uint32_t rest = seps & (seps - 1u);
+    if (__builtin_expect(!rest, 0)) return 0;
+    const uint32_t last = rest & -rest;
+    const uint32_t through_last = last | (last - 1u);
+    if (__builtin_expect((nls & through_last) != last, 0)) return 0;
+    const uint32_t quotes =
+        static_cast<uint32_t>(_mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8('"'))) & through_last;
+    uint32_t ends = seps & through_last;
+    const uint32_t starts = ((ends << 1) | 1u) & through_last;
+    const uint32_t opening = quotes & starts;
+    const uint32_t closing = (quotes << 1) & ends;
+    const uint32_t quoted = _pext_u32(opening, starts);
+    if (__builtin_expect((opening ^ (closing >> 1)) != quotes ||
+                             quoted != _pext_u32(closing, ends),
+                         0)) {
+        return 0;
+    }
+    const size_t e0 = static_cast<size_t>(__builtin_ctz(ends));
+    const size_t t0 = quoted & 1u;
+    fields[0] = std::string_view(p + t0, e0 - 2 * t0);
+    ends &= ends - 1u;
+    const size_t e1 = static_cast<size_t>(__builtin_ctz(ends));
+    const size_t t1 = (quoted >> 1) & 1u;
+    fields[1] = std::string_view(p + e0 + 1 + t1, e1 - e0 - 1 - 2 * t1);
+    return e1 + 1;
+}
+
 template <size_t N>
 SS_AVX512_ATTR [[gnu::always_inline]] inline size_t read_row_avx512(const char* p,
                                                                     std::string_view* f) noexcept {
-    if constexpr (N == 7) {
-        return read_row_avx2<7>(p, f);
+    if constexpr (N == 2) {
+        return read_fields2_32_avx512(p, f);
+    } else if constexpr (N == 7) {
+        const auto d0a = delimiters_avx512(p);
+        const auto d0c = delimiters32_avx512(p + 64);
+        const size_t a0 = extract_fields_64<3, false>(d0a, p, f);
+        if (__builtin_expect(a0 > 0 && a0 < 64, 1)) {
+            const unsigned sh = static_cast<unsigned>(64 - a0);
+            const Delimiters d0b{(d0a.commas >> a0) | (d0c.commas << sh),
+                                 (d0a.newlines >> a0) | (d0c.newlines << sh),
+                                 (d0a.quotes >> a0) | (d0c.quotes << sh)};
+            const size_t b0 = extract_fields_64<4, true>(d0b, p + a0, f + 3);
+            return b0 ? (a0 + b0) : 0;
+        }
+        return 0;
     } else {
         return read_fields_avx512<N, true>(p, f);
     }
@@ -532,7 +592,7 @@ template <size_t N, typename SlowCb>
         }                                                        \
     }
 
-#define SS_SCAN_ILP2_BODY(DELIM_FN, READ_ONE_EXPR)                                               \
+#define SS_SCAN_ILP2_BODY(DELIM_FN, DELIM32_FN, READ2_FN, READ_ONE_EXPR)                         \
     const char* const buf = view.data;                                                           \
     size_t pos0 = view.pos;                                                                      \
     const size_t limit = view.limit;                                                             \
@@ -556,38 +616,32 @@ template <size_t N, typename SlowCb>
         const char* p1 = buf + pos1;                                                             \
         size_t u0, u1;                                                                           \
         if constexpr (N == 7) {                                                                  \
-            const auto d0a = delimiters_avx2(p0);                                                \
-            const auto d1a = delimiters_avx2(p1);                                                \
-            const __m256i v0c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p0 + 64));   \
-            const __m256i v1c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1 + 64));   \
-            const uint64_t c0_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0c, _mm256_set1_epi8(',')))); \
-            const uint64_t n0_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0c, _mm256_set1_epi8('\n')))); \
-            const uint64_t q0_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0c, _mm256_set1_epi8('"')))); \
-            const uint64_t c1_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1c, _mm256_set1_epi8(',')))); \
-            const uint64_t n1_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1c, _mm256_set1_epi8('\n')))); \
-            const uint64_t q1_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1c, _mm256_set1_epi8('"')))); \
+            const auto d0a = DELIM_FN(p0);                                                       \
+            const auto d1a = DELIM_FN(p1);                                                       \
+            const auto d0c = DELIM32_FN(p0 + 64);                                                \
+            const auto d1c = DELIM32_FN(p1 + 64);                                                \
             const size_t a0 = extract_fields_64<3, false>(d0a, p0, f0);                          \
             const size_t a1 = extract_fields_64<3, false>(d1a, p1, f1);                          \
             size_t b0 = 0, b1 = 0;                                                               \
             if (__builtin_expect(a0 > 0 && a0 < 64, 1)) {                                        \
                 const unsigned sh0 = static_cast<unsigned>(64 - a0);                             \
-                const Delimiters d0b{(d0a.commas >> a0) | (c0_hi << sh0),                        \
-                                     (d0a.newlines >> a0) | (n0_hi << sh0),                      \
-                                     (d0a.quotes >> a0) | (q0_hi << sh0)};                       \
+                const Delimiters d0b{(d0a.commas >> a0) | (d0c.commas << sh0),                   \
+                                     (d0a.newlines >> a0) | (d0c.newlines << sh0),               \
+                                     (d0a.quotes >> a0) | (d0c.quotes << sh0)};                  \
                 b0 = extract_fields_64<4, true>(d0b, p0 + a0, f0 + 3);                           \
             }                                                                                    \
             if (__builtin_expect(a1 > 0 && a1 < 64, 1)) {                                        \
                 const unsigned sh1 = static_cast<unsigned>(64 - a1);                             \
-                const Delimiters d1b{(d1a.commas >> a1) | (c1_hi << sh1),                        \
-                                     (d1a.newlines >> a1) | (n1_hi << sh1),                      \
-                                     (d1a.quotes >> a1) | (q1_hi << sh1)};                       \
+                const Delimiters d1b{(d1a.commas >> a1) | (d1c.commas << sh1),                   \
+                                     (d1a.newlines >> a1) | (d1c.newlines << sh1),               \
+                                     (d1a.quotes >> a1) | (d1c.quotes << sh1)};                  \
                 b1 = extract_fields_64<4, true>(d1b, p1 + a1, f1 + 3);                           \
             }                                                                                    \
             u0 = b0 ? (a0 + b0) : 0;                                                             \
             u1 = b1 ? (a1 + b1) : 0;                                                             \
         } else if constexpr (N == 2) {                                                           \
-            u0 = read_fields2_32_avx2(p0, f0);                                                   \
-            u1 = read_fields2_32_avx2(p1, f1);                                                   \
+            u0 = READ2_FN(p0, f0);                                                               \
+            u1 = READ2_FN(p1, f1);                                                               \
         } else {                                                                                 \
             const auto d0 = DELIM_FN(p0);                                                        \
             const auto d1 = DELIM_FN(p1);                                                        \
@@ -613,14 +667,14 @@ template <size_t N, typename SlowCb>
 template <size_t N, typename FastCb, typename SlowCb>
 [[gnu::noinline]] void scan_pread_buf_avx2(const PreadView& view, FastCb&& on_fast_row,
                                            SlowCb&& on_slow_row) {
-    SS_SCAN_ILP2_BODY(delimiters_avx2, read_row_avx2<N>(p, f0))
+    SS_SCAN_ILP2_BODY(delimiters_avx2, delimiters32_avx2, read_fields2_32_avx2, read_row_avx2<N>(p, f0))
 }
 
 template <size_t N, typename FastCb, typename SlowCb>
 SS_AVX512_ATTR [[gnu::noinline]] void scan_pread_buf_avx512(const PreadView& view,
                                                             FastCb&& on_fast_row,
                                                             SlowCb&& on_slow_row) {
-    SS_SCAN_ILP2_BODY(delimiters_avx512, read_row_avx512<N>(p, f0))
+    SS_SCAN_ILP2_BODY(delimiters_avx512, delimiters32_avx512, read_fields2_32_avx512, read_row_avx512<N>(p, f0))
 }
 
 #undef SS_SCAN_ILP2_BODY

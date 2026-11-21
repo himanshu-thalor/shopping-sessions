@@ -24,8 +24,8 @@ class LinkTable {
 
     struct LinkedRoot {
         UserId name;
-        uint32_t root_lid;
-        uint32_t pad;
+        uint32_t lid_begin;
+        uint32_t lid_count;
     };
     static_assert(sizeof(LinkedRoot) == 16);
 
@@ -135,7 +135,7 @@ class LinkTable {
     const Partition& part(size_t s) const noexcept { return parts_[s]; }
     uint32_t total_linked() const noexcept { return total_linked_; }
     const std::vector<LinkedRoot>& linked_roots() const noexcept { return linked_roots_; }
-    uint32_t next_alias(uint32_t lid) const noexcept { return next_alias_[lid]; }
+    const uint32_t* flat_lids() const noexcept { return flat_lids_.get(); }
 
     // Prepare overlapped multi-thread link build state BEFORE Phase A's pool.run().
     // Returns the number of Phase A workers (tid 0..n_link-1) that will build links
@@ -418,9 +418,9 @@ class LinkTable {
             }
         }
 
-        // Build compact flat linked_roots_ and next_alias_ list.
-        next_alias_ = std::make_unique_for_overwrite<uint32_t[]>(N);
-        std::memset(next_alias_.get(), 0xFF, N * sizeof(uint32_t));
+        // Build compact flat linked_roots_ and contiguous flat_lids_[] (zero pointer chasing in C2!).
+        auto next_al = std::make_unique_for_overwrite<uint32_t[]>(N);
+        std::memset(next_al.get(), 0xFF, N * sizeof(uint32_t));
         linked_roots_.reserve(N / 2);
         for (uint32_t i = 0; i < N; ++i) {
             if (i + 16 < N) {
@@ -430,9 +430,23 @@ class LinkTable {
             if (c == i) {
                 linked_roots_.push_back(LinkedRoot{all_names[i], i, 0});
             } else {
-                next_alias_[i] = next_alias_[c];
-                next_alias_[c] = i;
+                next_al[i] = next_al[c];
+                next_al[c] = i;
             }
+        }
+        flat_lids_ = std::make_unique_for_overwrite<uint32_t[]>(N);
+        uint32_t* const fl = flat_lids_.get();
+        uint32_t w_lid = 0;
+        for (auto& lr : linked_roots_) {
+            uint32_t cur = lr.lid_begin;
+            lr.lid_begin = w_lid;
+            uint32_t cnt = 0;
+            while (cur != kNone) {
+                fl[w_lid++] = cur;
+                ++cnt;
+                cur = next_al[cur];
+            }
+            lr.lid_count = cnt;
         }
         std::vector<std::vector<std::vector<BlockSlice<Endpoint>>>>().swap(shard_eps_);
     }
@@ -443,7 +457,7 @@ class LinkTable {
     std::vector<OverflowArena> arenas_;
     uint32_t total_linked_ = 0;
     std::vector<LinkedRoot> linked_roots_;
-    std::unique_ptr<uint32_t[]> next_alias_;
+    std::unique_ptr<uint32_t[]> flat_lids_;
 
     // Overlapped build state
     std::vector<PreadFile>* files_ = nullptr;

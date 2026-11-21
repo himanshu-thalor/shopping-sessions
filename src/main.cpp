@@ -986,21 +986,21 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
         return std::min(SessionBins::max_words, (max_bin >> 6) + 1);
     }();
 
-    struct alignas(32) AliasSlot {
-        ShardEv* ev_ptr;
-        ShardClk* clk_ptr;
+    struct alignas(16) AliasSlot {
+        uint32_t ev_off;
+        uint32_t clk_off;
         uint32_t ev_len;
-        uint32_t clk_len;
-        uint32_t next;
-        uint32_t pad;
+        uint32_t shard_clk_len;  // (uint32_t(shard) << 23) | clk_len
     };
-    static_assert(sizeof(AliasSlot) == 32);
+    static_assert(sizeof(AliasSlot) == 16);
 
     const uint32_t total_linked = links.total_linked();
     HugeBuffer<AliasSlot> alias_slots;
     if (total_linked > 0) {
         alias_slots.assign_zero(total_linked);
     }
+    std::vector<ShardEv*> shard_ev_base(person_shards, nullptr);
+    std::vector<ShardClk*> shard_clk_base(person_shards, nullptr);
 
     // Per-thread scratch for sessionization, sorting, and attribution (shared across C1 and C2).
     struct WorkerCtx {
@@ -1561,12 +1561,20 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                         for (auto sl : ev_person_buckets[w][s]) {
                             SurvEv* const ptr = sl.ptr;
                             const uint32_t len = sl.len;
+                            uint64_t hring[16];
+                            const uint32_t pre = std::min<uint32_t>(16u, len);
+                            for (uint32_t i = 0; i < pre; ++i) {
+                                const UserId64 u0 = ptr[i].user_id;
+                                hring[i] = u0.empty() ? 0 : u0.hash(arenas);
+                            }
                             for (uint32_t i = 0; i < len; ++i) {
-                                if (i + 16 < len) {
-                                    const UserId64 nu = ptr[i + 16].user_id;
+                                const uint64_t h = hring[i & 15u];
+                                if (i + 16u < len) {
+                                    const UserId64 nu = ptr[i + 16u].user_id;
+                                    const uint64_t nh = nu.empty() ? 0 : nu.hash(arenas);
+                                    hring[i & 15u] = nh;
                                     if (!nu.empty()) {
-                                        __builtin_prefetch(&part.table[nu.hash(arenas) & mask], 1,
-                                                           1);
+                                        __builtin_prefetch(&part.table[nh & mask], 1, 1);
                                     }
                                 }
                                 UserId64& uid = ptr[i].user_id;
@@ -1574,7 +1582,7 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                                     uid.raw = UINT64_MAX;
                                     continue;
                                 }
-                                auto& entry = part.intern(uid, uid.hash(arenas), arenas);
+                                auto& entry = part.intern(uid, h, arenas);
                                 mask = part.table.size() - 1;
                                 ++entry.count;
                                 uid.raw = entry.local;
@@ -1601,13 +1609,20 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                         for (auto sl : clk_person_buckets[w][s]) {
                             SurvClk* const ptr = sl.ptr;
                             const uint32_t len = sl.len;
+                            uint64_t hring[16];
+                            const uint32_t pre = std::min<uint32_t>(16u, len);
+                            for (uint32_t i = 0; i < pre; ++i) {
+                                hring[i] = ptr[i].user_id.hash(arenas);
+                            }
                             for (uint32_t i = 0; i < len; ++i) {
-                                if (i + 16 < len) {
-                                    const uint64_t nh = ptr[i + 16].user_id.hash(arenas);
+                                const uint64_t h = hring[i & 15u];
+                                if (i + 16u < len) {
+                                    const uint64_t nh = ptr[i + 16u].user_id.hash(arenas);
+                                    hring[i & 15u] = nh;
                                     __builtin_prefetch(&part.table[nh & mask], 1, 1);
                                 }
                                 UserId64& uid = ptr[i].user_id;
-                                auto* ep = part.find_existing(uid, uid.hash(arenas), arenas);
+                                auto* ep = part.find_existing(uid, h, arenas);
                                 if (!ep) {
                                     uid.raw = UINT64_MAX;
                                 } else {
@@ -1677,16 +1692,17 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                     std::vector<BlockSlice<SurvClk>>().swap(clk_person_buckets[w][s]);
                 }
 
-                // Publish dense 32-byte AliasSlots for linked nodes in this shard.
+                // Publish compact 16-byte L3-resident AliasSlots for linked nodes in this shard.
+                shard_ev_base[s] = ev_dst;
+                shard_clk_base[s] = clk_dst;
+                const uint32_t s_tag = static_cast<uint32_t>(s) << 23;
                 for (uint32_t i = 0; i < num_linked_s; ++i) {
                     const uint32_t lid = base_lid + i;
                     slots_out[lid] = AliasSlot{
-                        ev_dst + ev_off[i],
-                        clk_dst + clk_off[i],
+                        ev_off[i],
+                        clk_off[i],
                         ev_off[i + 1] - ev_off[i],
-                        clk_off[i + 1] - clk_off[i],
-                        links.next_alias(lid),
-                        0,
+                        s_tag | (clk_off[i + 1] - clk_off[i]),
                     };
                 }
 
@@ -1715,6 +1731,9 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
         pool.run([&](size_t tid) {
             auto& ctx = ctxs[tid];
             const AliasSlot* const slots = alias_slots.data();
+            const uint32_t* const flat_lids = links.flat_lids();
+            ShardEv* const* const ev_bases = shard_ev_base.data();
+            ShardClk* const* const clk_bases = shard_clk_base.data();
             const size_t nroots = roots.size();
 
             struct RootWork {
@@ -1723,7 +1742,6 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                 size_t nclk;
                 uint32_t span_begin;
                 uint32_t span_end;
-                uint32_t cur_lid;
             };
             struct SpanRef {
                 ShardEv* ev_ptr;
@@ -1744,49 +1762,40 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
 
                 for (size_t b0 = r0; b0 < r_lim; b0 += kBatch) {
                     const size_t B = std::min(kBatch, r_lim - b0);
-                    // Wavefront prefetch initial root AliasSlots.
-                    for (size_t j = 0; j < B; ++j) {
-                        const uint32_t rlid = roots[b0 + j].root_lid;
-                        __builtin_prefetch(&slots[rlid], 0, 1);
-                        rwork[j] = RootWork{roots[b0 + j].name, 0, 0, 0, 0, rlid};
+                    // Zero-pointer-chase parallel prefetch of ALL AliasSlots in the batch!
+                    const uint32_t fl_start = roots[b0].lid_begin;
+                    const uint32_t fl_end =
+                        roots[b0 + B - 1].lid_begin + roots[b0 + B - 1].lid_count;
+                    for (uint32_t fi = fl_start; fi < fl_end; ++fi) {
+                        __builtin_prefetch(&slots[flat_lids[fi]], 0, 1);
                     }
 
-                    // Collect spans per root while prefetching next alias slots in lockstep.
                     batch_spans.clear();
                     for (size_t j = 0; j < B; ++j) {
-                        if (j + 2 < B) {
-                            const uint32_t nl = slots[rwork[j + 2].cur_lid].next;
-                            if (nl != LinkTable::kNone) __builtin_prefetch(&slots[nl], 0, 1);
-                        }
-                        rwork[j].span_begin = static_cast<uint32_t>(batch_spans.size());
-                        uint32_t lid = rwork[j].cur_lid;
+                        const auto& rt = roots[b0 + j];
+                        const uint32_t sb = static_cast<uint32_t>(batch_spans.size());
                         size_t nev = 0, nclk = 0;
-                        while (lid != LinkTable::kNone) {
-                            const AliasSlot& sl = slots[lid];
-                            const uint32_t nxt = sl.next;
-                            if (nxt != LinkTable::kNone) __builtin_prefetch(&slots[nxt], 0, 1);
-                            if (sl.ev_len || sl.clk_len) {
-                                batch_spans.push_back(
-                                    SpanRef{sl.ev_ptr, sl.clk_ptr, sl.ev_len, sl.clk_len});
+                        const uint32_t fb = rt.lid_begin;
+                        const uint32_t fe = fb + rt.lid_count;
+                        for (uint32_t fi = fb; fi < fe; ++fi) {
+                            const AliasSlot& sl = slots[flat_lids[fi]];
+                            const uint32_t clen = sl.shard_clk_len & 0x7FFFFFu;
+                            if (sl.ev_len || clen) {
+                                const size_t sh = static_cast<size_t>(sl.shard_clk_len >> 23);
+                                ShardEv* const ep = ev_bases[sh] + sl.ev_off;
+                                ShardClk* const cp = clk_bases[sh] + sl.clk_off;
+                                if (sl.ev_len) __builtin_prefetch(ep, 0, 1);
+                                if (clen) __builtin_prefetch(cp, 0, 1);
+                                batch_spans.push_back(SpanRef{ep, cp, sl.ev_len, clen});
                                 nev += sl.ev_len;
-                                nclk += sl.clk_len;
+                                nclk += clen;
                             }
-                            lid = nxt;
                         }
-                        rwork[j].nev = nev;
-                        rwork[j].nclk = nclk;
-                        rwork[j].span_end = static_cast<uint32_t>(batch_spans.size());
+                        rwork[j] = RootWork{rt.name, nev, nclk, sb,
+                                            static_cast<uint32_t>(batch_spans.size())};
                     }
 
-                    // Prefetch payload cache lines across the entire batch!
-                    for (size_t j = 0; j < B; ++j) {
-                        if (rwork[j].nev == 0) continue;
-                        for (uint32_t si = rwork[j].span_begin; si < rwork[j].span_end; ++si) {
-                            const SpanRef& sp = batch_spans[si];
-                            if (sp.ev_len) __builtin_prefetch(sp.ev_ptr, 0, 1);
-                            if (sp.clk_len) __builtin_prefetch(sp.clk_ptr, 0, 1);
-                        }
-                    }
+
 
                     // Process each root in the batch.
                     for (size_t j = 0; j < B; ++j) {
