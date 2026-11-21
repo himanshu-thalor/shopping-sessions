@@ -108,16 +108,16 @@ inline bool parse_4d(const char* p, int64_t& out) noexcept {
 
 struct DateLut {
     struct Entry {
-        uint64_t hi8 = 0;  // "YYYY-MM-"
+        uint64_t hi8 = 0;
         int64_t midnight_ms = 0;
-        uint16_t lo2 = 0;  // "DD"
+        uint16_t lo2 = 0;
     };
     std::array<Entry, 32> entries{};
 
     void build(int64_t start_ms, int64_t end_ms) noexcept {
         entries.fill(Entry{});
         const int64_t d0 = floor_div_day(start_ms);
-        const int64_t d1 = floor_div_day(end_ms) + 7;  // cover late ingests too
+        const int64_t d1 = floor_div_day(end_ms) + 7;
         const int64_t count = std::min<int64_t>(28, d1 - d0 + 1);
         for (int64_t i = 0; i < count; ++i) {
             const int64_t day_num = d0 + i;
@@ -290,204 +290,101 @@ inline bool parse_price_cents(std::string_view sv, uint32_t& out_price) noexcept
 
 namespace csv_simd {
 
-template <size_t N, typename Callback>
-inline void dispatch_line(const char* buf, size_t line_start, size_t line_end,
-                          const size_t (&comma_pos)[N], size_t comma_cnt,
-                          const size_t (&quote_pos)[2 * N], size_t quote_cnt,
-                          bool bad_line, Callback&& cb) {
-    if (bad_line || line_end <= line_start || comma_cnt != N - 1 || (quote_cnt & 1u) != 0) {
-        return;
+struct Delimiters {
+    uint64_t commas;
+    uint64_t newlines;
+    uint64_t quotes;
+};
+
+inline uint64_t match64(__m256i low, __m256i high, char needle) {
+    const __m256i target = _mm256_set1_epi8(needle);
+    const uint32_t a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, target));
+    const uint32_t b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, target));
+    return a | (static_cast<uint64_t>(b) << 32);
+}
+
+inline Delimiters delimiters_avx2(const char* p) {
+    const __m256i low = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    const __m256i high = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+    return {match64(low, high, ','), match64(low, high, '\n'), match64(low, high, '"')};
+}
+
+__attribute__((target("avx512f,avx512bw"))) inline Delimiters delimiters_avx512(const char* p) {
+    const __m512i v = _mm512_loadu_si512(p);
+    return {_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(',')),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('\n')),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('"'))};
+}
+
+// Read K fields that fit within one 64-byte load. A return of zero asks
+// the caller to use the unbounded parser for this row.
+template <size_t K, bool EndOfLine, auto classify>
+inline size_t read_fields(const char* p, std::string_view* fields) {
+    const auto masks = classify(p);
+    const uint64_t separators = masks.commas | masks.newlines;
+    uint64_t rest = separators;
+    for (size_t i = 1; i < K; ++i) rest &= rest - 1;
+    if (!rest) return 0;
+    const uint64_t last = rest & -rest;
+    const uint64_t through_last = last | (last - 1);
+    if ((masks.newlines & through_last) != (EndOfLine ? last : 0)) return 0;
+    uint64_t ends = separators & through_last;
+    const uint64_t quotes = masks.quotes & through_last;
+    unsigned quoted = 0;
+    if (quotes) {
+        const uint64_t starts = ((ends << 1) | 1) & through_last;
+        const uint64_t opening = quotes & starts;
+        const uint64_t closing = (quotes << 1) & ends;
+        quoted = static_cast<unsigned>(_pext_u64(opening, starts));
+        // Every quote must occur at exactly one boundary. Each opening
+        // must also have a closing quote in the same field.
+        if ((opening ^ (closing >> 1)) != quotes || quoted != _pext_u64(closing, ends)) return 0;
     }
-    std::string_view fields[N];
-    if (quote_cnt == 0) {
-        for (size_t fi = 0; fi < N; ++fi) {
-            const size_t fs = (fi == 0) ? line_start : (comma_pos[fi - 1] + 1);
-            const size_t fe = (fi + 1 == N) ? line_end : comma_pos[fi];
-            fields[fi] = std::string_view(buf + fs, fe - fs);
-        }
-        cb(fields);
-        return;
+    size_t start = 0;
+    for (size_t i = 0; i < K; ++i) {
+        const size_t end = __builtin_ctzll(ends);
+        const size_t trim = (quoted >> i) & 1;
+        fields[i] = std::string_view(p + start + trim, end - start - 2 * trim);
+        ends &= ends - 1;
+        start = end + 1;
     }
-    size_t qi = 0;
-    for (size_t fi = 0; fi < N; ++fi) {
-        const size_t fs = (fi == 0) ? line_start : (comma_pos[fi - 1] + 1);
-        const size_t fe = (fi + 1 == N) ? line_end : comma_pos[fi];
-        if (qi < quote_cnt && quote_pos[qi] == fs) {
-            if (fe - fs >= 2 && quote_pos[qi + 1] == fe - 1) {
-                fields[fi] = std::string_view(buf + fs + 1, (fe - fs) - 2);
-                qi += 2;
-            } else {
-                return;
-            }
+    return start;
+}
+
+template <size_t N, auto classify, typename Callback>
+void scan_rows(const char* buf, size_t pos, size_t limit, size_t len, Callback&& cb) {
+    while (pos < limit) {
+        std::string_view fields[N];
+        const char* p = buf + pos;
+        size_t used;
+        if constexpr (N == 7) {
+            const size_t first = read_fields<3, false, classify>(p, fields);
+            const size_t last = first ? read_fields<4, true, classify>(p + first, fields + 3) : 0;
+            used = last ? first + last : 0;
         } else {
-            if (qi < quote_cnt && quote_pos[qi] < fe) return;
-            fields[fi] = std::string_view(buf + fs, fe - fs);
+            used = read_fields<N, true, classify>(p, fields);
         }
-    }
-    if (qi == quote_cnt) {
-        cb(fields);
-    }
-}
-
-template <size_t N, typename Callback>
-__attribute__((target("avx512f,avx512bw,bmi,bmi2"))) void scan_csv_avx512(
-    const char* buf, size_t data_start, size_t limit_in_buf, size_t buf_len, Callback&& cb) {
-    if (data_start >= limit_in_buf) return;
-
-    const __m512i v_nl = _mm512_set1_epi8('\n');
-    const __m512i v_cm = _mm512_set1_epi8(',');
-    const __m512i v_qt = _mm512_set1_epi8('"');
-
-    size_t pos = data_start;
-    size_t line_start = data_start;
-    size_t comma_pos[N]{};
-    size_t quote_pos[2 * N]{};
-    size_t comma_cnt = 0;
-    size_t quote_cnt = 0;
-    bool bad_line = false;
-
-    while (pos < buf_len) {
-        const size_t rem = buf_len - pos;
-        const uint64_t valid_mask = (rem >= 64) ? ~0ULL : ((1ULL << rem) - 1ULL);
-        const __m512i v = _mm512_loadu_si512(reinterpret_cast<const void*>(buf + pos));
-        const uint64_t nl_m = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(v, v_nl)) & valid_mask;
-        const uint64_t cm_m = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(v, v_cm)) & valid_mask;
-        const uint64_t qt_m = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(v, v_qt)) & valid_mask;
-
-        uint64_t any = nl_m | cm_m | qt_m;
-        while (any != 0) {
-            const unsigned bit = static_cast<unsigned>(__builtin_ctzll(any));
-            const uint64_t bmask = 1ULL << bit;
-            any &= any - 1;
-            const size_t abs_pos = pos + bit;
-            if (cm_m & bmask) {
-                if (!bad_line) {
-                    if (comma_cnt + 1 < N) {
-                        comma_pos[comma_cnt++] = abs_pos;
-                    } else {
-                        bad_line = true;
-                    }
-                }
-            } else if (qt_m & bmask) {
-                if (!bad_line) {
-                    if (quote_cnt < 2 * N) {
-                        quote_pos[quote_cnt++] = abs_pos;
-                    } else {
-                        bad_line = true;
-                    }
-                }
-            } else {
-                dispatch_line<N>(buf, line_start, abs_pos, comma_pos, comma_cnt, quote_pos,
-                                 quote_cnt, bad_line, cb);
-                line_start = abs_pos + 1;
-                comma_cnt = 0;
-                quote_cnt = 0;
-                bad_line = false;
-                if (line_start >= limit_in_buf) return;
-            }
+        if (used) {
+            cb(fields);
+            pos += used;
+        } else {
+            const char* nl = static_cast<const char*>(std::memchr(p, '\n', len - pos));
+            const size_t width = nl ? size_t(nl - p) : len - pos;
+            if (split_csv_line<N>(p, width, fields)) cb(fields);
+            pos += width + 1;
         }
-        pos += (rem >= 64) ? 64 : rem;
-    }
-
-    if (line_start < limit_in_buf && buf_len > line_start) {
-        dispatch_line<N>(buf, line_start, buf_len, comma_pos, comma_cnt, quote_pos, quote_cnt,
-                         bad_line, cb);
-    }
-}
-
-template <size_t N, typename Callback>
-__attribute__((target("avx2,bmi,bmi2"))) void scan_csv_avx2(
-    const char* buf, size_t data_start, size_t limit_in_buf, size_t buf_len, Callback&& cb) {
-    if (data_start >= limit_in_buf) return;
-
-    const __m256i v_nl = _mm256_set1_epi8('\n');
-    const __m256i v_cm = _mm256_set1_epi8(',');
-    const __m256i v_qt = _mm256_set1_epi8('"');
-
-    size_t pos = data_start;
-    size_t line_start = data_start;
-    size_t comma_pos[N]{};
-    size_t quote_pos[2 * N]{};
-    size_t comma_cnt = 0;
-    size_t quote_cnt = 0;
-    bool bad_line = false;
-
-    while (pos < buf_len) {
-        const size_t rem = buf_len - pos;
-        const uint64_t valid_mask = (rem >= 64) ? ~0ULL : ((1ULL << rem) - 1ULL);
-        const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + pos));
-        const __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + pos + 32));
-
-        const uint64_t nl_m =
-            (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl))) |
-             (static_cast<uint64_t>(
-                  static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl))))
-              << 32)) &
-            valid_mask;
-        const uint64_t cm_m =
-            (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm))) |
-             (static_cast<uint64_t>(
-                  static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm))))
-              << 32)) &
-            valid_mask;
-        const uint64_t qt_m =
-            (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt))) |
-             (static_cast<uint64_t>(
-                  static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt))))
-              << 32)) &
-            valid_mask;
-
-        uint64_t any = nl_m | cm_m | qt_m;
-        while (any != 0) {
-            const unsigned bit = static_cast<unsigned>(__builtin_ctzll(any));
-            const uint64_t bmask = 1ULL << bit;
-            any &= any - 1;
-            const size_t abs_pos = pos + bit;
-            if (cm_m & bmask) {
-                if (!bad_line) {
-                    if (comma_cnt + 1 < N) {
-                        comma_pos[comma_cnt++] = abs_pos;
-                    } else {
-                        bad_line = true;
-                    }
-                }
-            } else if (qt_m & bmask) {
-                if (!bad_line) {
-                    if (quote_cnt < 2 * N) {
-                        quote_pos[quote_cnt++] = abs_pos;
-                    } else {
-                        bad_line = true;
-                    }
-                }
-            } else {
-                dispatch_line<N>(buf, line_start, abs_pos, comma_pos, comma_cnt, quote_pos,
-                                 quote_cnt, bad_line, cb);
-                line_start = abs_pos + 1;
-                comma_cnt = 0;
-                quote_cnt = 0;
-                bad_line = false;
-                if (line_start >= limit_in_buf) return;
-            }
-        }
-        pos += (rem >= 64) ? 64 : rem;
-    }
-
-    if (line_start < limit_in_buf && buf_len > line_start) {
-        dispatch_line<N>(buf, line_start, buf_len, comma_pos, comma_cnt, quote_pos, quote_cnt,
-                         bad_line, cb);
     }
 }
 
 }  // namespace csv_simd
 
 template <size_t N, typename Callback>
-inline void for_each_csv_line(const char* buf, size_t data_start, size_t limit_in_buf,
-                              size_t buf_len, Callback&& cb) {
+inline void for_each_csv_line(const char* buf, size_t start, size_t limit, size_t len, Callback&& cb) {
     static const bool has_avx512bw = __builtin_cpu_supports("avx512bw");
     if (has_avx512bw) {
-        csv_simd::scan_csv_avx512<N>(buf, data_start, limit_in_buf, buf_len, cb);
+        csv_simd::scan_rows<N, csv_simd::delimiters_avx512>(buf, start, limit, len, cb);
     } else {
-        csv_simd::scan_csv_avx2<N>(buf, data_start, limit_in_buf, buf_len, cb);
+        csv_simd::scan_rows<N, csv_simd::delimiters_avx2>(buf, start, limit, len, cb);
     }
 }
 

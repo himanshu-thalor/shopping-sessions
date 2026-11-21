@@ -5,6 +5,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -18,47 +19,25 @@ struct PreadFile {
     PreadFile() = default;
     PreadFile(const PreadFile&) = delete;
     PreadFile& operator=(const PreadFile&) = delete;
-    PreadFile(PreadFile&& other) noexcept : fd(other.fd), size(other.size) {
-        other.fd = -1;
-        other.size = 0;
+
+    PreadFile(PreadFile&& o) noexcept : fd(o.fd), size(o.size) {
+        o.fd = -1;
+        o.size = 0;
     }
-    PreadFile& operator=(PreadFile&& other) noexcept {
-        if (this != &other) {
-            close_fd();
-            fd = other.fd;
-            size = other.size;
-            other.fd = -1;
-            other.size = 0;
+
+    PreadFile& operator=(PreadFile&& o) noexcept {
+        if (this != &o) {
+            if (fd >= 0) ::close(fd);
+            fd = o.fd;
+            size = o.size;
+            o.fd = -1;
+            o.size = 0;
         }
         return *this;
     }
-    ~PreadFile() { close_fd(); }
 
-    void close_fd() noexcept {
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
-        }
-        size = 0;
-    }
-
-    static PreadFile open_readonly(const std::string& path) {
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) {
-            throw std::runtime_error("failed to open: " + path);
-        }
-        struct stat st {};
-        if (::fstat(fd, &st) != 0) {
-            ::close(fd);
-            throw std::runtime_error("failed to fstat: " + path);
-        }
-        PreadFile pf;
-        pf.fd = fd;
-        pf.size = static_cast<size_t>(st.st_size);
-        if (pf.size > 0) {
-            ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-        }
-        return pf;
+    ~PreadFile() {
+        if (fd >= 0) ::close(fd);
     }
 };
 
@@ -91,24 +70,43 @@ inline std::vector<std::string> list_csv_files(const std::string& dir) {
     return paths;
 }
 
-inline std::vector<PreadFile> open_all_csvs(const std::string& dir) {
+inline std::vector<PreadFile> open_all_pread_files(const std::string& dir,
+                                                   size_t* out_total_bytes = nullptr) {
     auto paths = list_csv_files(dir);
     std::vector<PreadFile> files;
     files.reserve(paths.size());
+    size_t total = 0;
     for (const auto& p : paths) {
-        files.push_back(PreadFile::open_readonly(p));
+        int fd = ::open(p.c_str(), O_RDONLY);
+        if (fd < 0) {
+            throw std::runtime_error("failed to open: " + p);
+        }
+        struct stat st {};
+        if (::fstat(fd, &st) != 0) {
+            ::close(fd);
+            throw std::runtime_error("failed to fstat: " + p);
+        }
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        const size_t sz = static_cast<size_t>(st.st_size);
+        total += sz;
+        PreadFile pf;
+        pf.fd = fd;
+        pf.size = sz;
+        files.push_back(std::move(pf));
     }
+    if (out_total_bytes) *out_total_bytes = total;
     return files;
 }
 
 inline std::vector<PreadChunk> build_pread_chunks(const std::vector<PreadFile>& files,
-                                                  size_t chunk_bytes = size_t(2) << 20) {
+                                                  size_t chunk_bytes = size_t(1) << 20) {
     std::vector<PreadChunk> chunks;
-    for (const PreadFile& f : files) {
-        if (f.size == 0) continue;
-        for (size_t pos = 0; pos < f.size; pos += chunk_bytes) {
-            const size_t end = std::min(f.size, pos + chunk_bytes);
-            chunks.push_back(PreadChunk{f.fd, f.size, pos, end});
+    for (const auto& f : files) {
+        const size_t sz = f.size;
+        if (sz == 0) continue;
+        for (size_t pos = 0; pos < sz; pos += chunk_bytes) {
+            const size_t end = std::min(sz, pos + chunk_bytes);
+            chunks.push_back(PreadChunk{f.fd, sz, pos, end});
         }
     }
     return chunks;
@@ -135,6 +133,7 @@ inline void read_chunk_into(const PreadChunk& c, std::vector<char>& buf, size_t&
         buf_len = 0;
         return;
     }
+
     const size_t read_from = (c.start == 0) ? 0 : (c.start - 1);
     const size_t limit = c.end - read_from;
     static constexpr size_t kTailWindow = 65536;
@@ -171,10 +170,16 @@ inline void read_chunk_into(const PreadChunk& c, std::vector<char>& buf, size_t&
 }
 
 inline std::vector<char> read_whole_file(const std::string& path) {
-    PreadFile pf = PreadFile::open_readonly(path);
-    std::vector<char> data(pf.size);
-    if (pf.size > 0) {
-        pread_exact(pf.fd, data.data(), pf.size, 0);
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("failed to open: " + path);
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        ::close(fd);
+        throw std::runtime_error("failed to fstat: " + path);
     }
+    const size_t sz = static_cast<size_t>(st.st_size);
+    std::vector<char> data(sz);
+    if (sz > 0) pread_exact(fd, data.data(), sz, 0);
+    ::close(fd);
     return data;
 }

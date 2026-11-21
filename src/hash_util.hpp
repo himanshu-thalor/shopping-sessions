@@ -1,9 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <string_view>
+#include <sys/mman.h>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -78,6 +81,13 @@ inline uint64_t wyhash64(std::string_view sv) noexcept {
     return wyhash64(sv.data(), sv.size());
 }
 
+inline uint64_t hash_inline_12(uint64_t lo, uint32_t hi) noexcept {
+    uint64_t h = wyhash_mix(lo ^ 0xa0761d6478bd642full,
+                            static_cast<uint64_t>(hi) ^ 0xe7037ed1a0b428dbull);
+    h = wyhash_mix(h, 0x8ebc6af09c88c6e3ull);
+    return h ? h : 1;
+}
+
 inline bool byte_less(std::string_view a, std::string_view b) noexcept {
     const size_t n = a.size() < b.size() ? a.size() : b.size();
     if (n > 0) {
@@ -86,6 +96,205 @@ inline bool byte_less(std::string_view a, std::string_view b) noexcept {
     }
     return a.size() < b.size();
 }
+
+template <typename T>
+class HugeBuffer {
+   public:
+    HugeBuffer() = default;
+    HugeBuffer(const HugeBuffer&) = delete;
+    HugeBuffer& operator=(const HugeBuffer&) = delete;
+    HugeBuffer(HugeBuffer&& other) noexcept
+        : ptr_(other.ptr_), count_(other.count_), mapped_bytes_(other.mapped_bytes_) {
+        other.ptr_ = nullptr;
+        other.count_ = 0;
+        other.mapped_bytes_ = 0;
+    }
+    HugeBuffer& operator=(HugeBuffer&& other) noexcept {
+        if (this != &other) {
+            release();
+            ptr_ = other.ptr_;
+            count_ = other.count_;
+            mapped_bytes_ = other.mapped_bytes_;
+            other.ptr_ = nullptr;
+            other.count_ = 0;
+            other.mapped_bytes_ = 0;
+        }
+        return *this;
+    }
+    ~HugeBuffer() { release(); }
+
+    void assign_zero(size_t n) {
+        release();
+        if (n == 0) return;
+        const size_t bytes = n * sizeof(T);
+        constexpr size_t kHuge = size_t(2) << 20;
+        if (bytes >= kHuge) {
+            const size_t aligned_bytes = (bytes + kHuge - 1) & ~(kHuge - 1);
+            const size_t map_sz = aligned_bytes + kHuge;
+            void* raw = ::mmap(nullptr, map_sz, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (raw != MAP_FAILED) {
+                uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
+                uintptr_t aligned = (addr + kHuge - 1) & ~(uintptr_t(kHuge) - 1);
+                if (aligned > addr) ::munmap(raw, aligned - addr);
+                size_t tail = (addr + map_sz) - (aligned + aligned_bytes);
+                if (tail > 0) ::munmap(reinterpret_cast<void*>(aligned + aligned_bytes), tail);
+                ::madvise(reinterpret_cast<void*>(aligned), aligned_bytes, MADV_HUGEPAGE);
+                ptr_ = reinterpret_cast<T*>(aligned);
+                count_ = n;
+                mapped_bytes_ = aligned_bytes;
+                return;
+            }
+        }
+        ptr_ = new T[n]{};
+        count_ = n;
+        mapped_bytes_ = 0;
+    }
+
+    void release() noexcept {
+        if (ptr_) {
+            if (mapped_bytes_ > 0) {
+                ::munmap(ptr_, mapped_bytes_);
+            } else {
+                delete[] ptr_;
+            }
+        }
+        ptr_ = nullptr;
+        count_ = 0;
+        mapped_bytes_ = 0;
+    }
+
+    T& operator[](size_t i) noexcept { return ptr_[i]; }
+    const T& operator[](size_t i) const noexcept { return ptr_[i]; }
+    size_t size() const noexcept { return count_; }
+    bool empty() const noexcept { return count_ == 0; }
+    T* data() noexcept { return ptr_; }
+    const T* data() const noexcept { return ptr_; }
+
+   private:
+    T* ptr_ = nullptr;
+    size_t count_ = 0;
+    size_t mapped_bytes_ = 0;
+};
+
+class HugeBlockPool {
+   public:
+    explicit HugeBlockPool(size_t block_bytes) : block_bytes_(block_bytes) {}
+    HugeBlockPool(const HugeBlockPool&) = delete;
+    HugeBlockPool& operator=(const HugeBlockPool&) = delete;
+
+    ~HugeBlockPool() {
+        for (const auto& r : regions_) {
+            ::munmap(r.ptr, r.bytes);
+        }
+    }
+
+    size_t block_bytes() const noexcept { return block_bytes_; }
+
+    size_t alloc_batch(void** out, size_t max_n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t got = 0;
+        while (got < max_n && !free_list_.empty()) {
+            out[got++] = free_list_.back();
+            free_list_.pop_back();
+        }
+        while (got < max_n) {
+            grow_locked();
+            while (got < max_n && !free_list_.empty()) {
+                out[got++] = free_list_.back();
+                free_list_.pop_back();
+            }
+        }
+        return got;
+    }
+
+    void free_batch(void* const* in, size_t n) {
+        if (n == 0) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        free_list_.insert(free_list_.end(), in, in + n);
+    }
+
+   private:
+    struct Region {
+        void* ptr;
+        size_t bytes;
+    };
+
+    void grow_locked() {
+        constexpr size_t kHuge = size_t(2) << 20;
+        const size_t reg_bytes = next_reg_bytes_;
+        if (next_reg_bytes_ < (size_t(16) << 20)) next_reg_bytes_ <<= 1;
+
+        const size_t map_sz = reg_bytes + kHuge;
+        void* raw = ::mmap(nullptr, map_sz, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED) throw std::bad_alloc();
+
+        uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
+        uintptr_t aligned = (addr + kHuge - 1) & ~(uintptr_t(kHuge) - 1);
+        if (aligned > addr) ::munmap(raw, aligned - addr);
+        const size_t tail = (addr + map_sz) - (aligned + reg_bytes);
+        if (tail > 0) ::munmap(reinterpret_cast<void*>(aligned + reg_bytes), tail);
+        ::madvise(reinterpret_cast<void*>(aligned), reg_bytes, MADV_HUGEPAGE);
+
+        regions_.push_back(Region{reinterpret_cast<void*>(aligned), reg_bytes});
+        char* base = reinterpret_cast<char*>(aligned);
+        const size_t nblocks = reg_bytes / block_bytes_;
+        free_list_.reserve(free_list_.size() + nblocks);
+        // Push in reverse so pops yield ascending addresses
+        for (size_t i = nblocks; i-- > 0;) {
+            free_list_.push_back(base + i * block_bytes_);
+        }
+    }
+
+    size_t block_bytes_;
+    size_t next_reg_bytes_ = size_t(2) << 20;
+    std::mutex mu_;
+    std::vector<Region> regions_;
+    std::vector<void*> free_list_;
+};
+
+class ThreadBlockCache {
+   public:
+    explicit ThreadBlockCache(HugeBlockPool* pool = nullptr) : pool_(pool) {}
+
+    ~ThreadBlockCache() { flush_all(); }
+
+    void init(HugeBlockPool* pool) {
+        flush_all();
+        pool_ = pool;
+    }
+
+    void* alloc() {
+        if (cache_.empty()) {
+            void* tmp[8];
+            const size_t got = pool_->alloc_batch(tmp, 8);
+            cache_.insert(cache_.end(), tmp, tmp + got);
+        }
+        void* p = cache_.back();
+        cache_.pop_back();
+        return p;
+    }
+
+    void free(void* p) {
+        cache_.push_back(p);
+        if (cache_.size() >= 64) {
+            pool_->free_batch(cache_.data() + 32, cache_.size() - 32);
+            cache_.resize(32);
+        }
+    }
+
+    void flush_all() {
+        if (pool_ && !cache_.empty()) {
+            pool_->free_batch(cache_.data(), cache_.size());
+            cache_.clear();
+        }
+    }
+
+   private:
+    HugeBlockPool* pool_ = nullptr;
+    std::vector<void*> cache_;
+};
 
 struct OverflowArena {
     static constexpr size_t BLOCK_SHIFT = 20;  // 1 MB blocks
@@ -158,7 +367,11 @@ struct alignas(4) CompactStr {
 
     static CompactStr make_inline(std::string_view sv) noexcept {
         CompactStr s{};
-        if (!sv.empty()) {
+        if (sv.size() >= 8) {
+            // Overlap the two fixed-width loads for 8..11 byte identifiers.
+            std::memcpy(s.d, sv.data(), 8);
+            std::memcpy(s.d + sv.size() - 4, sv.data() + sv.size() - 4, 4);
+        } else if (!sv.empty()) {
             std::memcpy(s.d, sv.data(), sv.size());
         }
         s.d[11] = static_cast<uint8_t>(sv.size());
@@ -273,6 +486,31 @@ struct alignas(4) CompactStr {
 static_assert(sizeof(CompactStr) == 12);
 static_assert(std::is_trivially_copyable_v<CompactStr>);
 
+inline uint64_t fast_str_hash(std::string_view sv) noexcept {
+    if (sv.size() <= 11) {
+        CompactStr cs = CompactStr::make_inline(sv);
+        uint64_t lo;
+        uint32_t hi;
+        std::memcpy(&lo, cs.d, 8);
+        std::memcpy(&hi, cs.d + 8, 4);
+        return hash_inline_12(lo, hi);
+    }
+    const uint64_t h = wyhash64(sv);
+    return h ? h : 1;
+}
+
+inline uint64_t fast_compact_hash(const CompactStr& cs, const OverflowArena* arenas) noexcept {
+    if (cs.is_inline()) {
+        uint64_t lo;
+        uint32_t hi;
+        std::memcpy(&lo, cs.d, 8);
+        std::memcpy(&hi, cs.d + 8, 4);
+        return hash_inline_12(lo, hi);
+    }
+    const uint64_t h = wyhash64(cs.raw_view(arenas));
+    return h ? h : 1;
+}
+
 template <typename V>
 class FlatStrMap {
    public:
@@ -298,14 +536,7 @@ class FlatStrMap {
 
     const V* find(std::string_view sv) const noexcept {
         if (table_.empty()) return nullptr;
-        uint64_t h = wyhash64(sv);
-        if (h == 0) h = 1;
-        return find_with_hash(sv, h);
-    }
-
-    const V* find_with_hash(std::string_view sv, uint64_t h) const noexcept {
-        if (table_.empty()) return nullptr;
-        if (h == 0) h = 1;
+        const uint64_t h = fast_str_hash(sv);
         const size_t mask = table_.size() - 1;
         size_t idx = static_cast<size_t>(h) & mask;
         for (;;) {
@@ -325,8 +556,7 @@ class FlatStrMap {
         if ((count_ + 1) * 20 >= table_.size() * 11) {
             rehash(table_.empty() ? 1024 : table_.size() * 2);
         }
-        uint64_t h = wyhash64(sv);
-        if (h == 0) h = 1;
+        const uint64_t h = fast_str_hash(sv);
         const size_t mask = table_.size() - 1;
         size_t idx = static_cast<size_t>(h) & mask;
         for (;;) {
@@ -373,44 +603,66 @@ class FlatStrMap {
     size_t count_ = 0;
 };
 
-template <typename T, size_t BlockCap = ((65536u / sizeof(T)) >= 256u ? (65536u / sizeof(T)) : 256u)>
+template <typename T, size_t BlockCap = 1024>
 class ChunkedVec {
+    static_assert((BlockCap & (BlockCap - 1)) == 0);
     static_assert(std::is_trivially_copyable_v<T>);
     static_assert(std::is_trivially_destructible_v<T>);
 
    public:
-    ChunkedVec() = default;
+    explicit ChunkedVec(ThreadBlockCache* cache = nullptr) : cache_(cache) {}
     ChunkedVec(const ChunkedVec&) = delete;
     ChunkedVec& operator=(const ChunkedVec&) = delete;
     ChunkedVec(ChunkedVec&& other) noexcept
-        : blocks_(std::move(other.blocks_)), count_(other.count_), tail_pos_(other.tail_pos_) {
-        other.count_ = 0;
-        other.tail_pos_ = BlockCap;
+        : cache_(other.cache_),
+          blocks_(std::move(other.blocks_)),
+          cur_(other.cur_),
+          end_(other.end_),
+          full_count_(other.full_count_) {
+        other.cur_ = nullptr;
+        other.end_ = nullptr;
+        other.full_count_ = 0;
     }
     ChunkedVec& operator=(ChunkedVec&& other) noexcept {
         if (this != &other) {
             clear_and_free();
+            cache_ = other.cache_;
             blocks_ = std::move(other.blocks_);
-            count_ = other.count_;
-            tail_pos_ = other.tail_pos_;
-            other.count_ = 0;
-            other.tail_pos_ = BlockCap;
+            cur_ = other.cur_;
+            end_ = other.end_;
+            full_count_ = other.full_count_;
+            other.cur_ = nullptr;
+            other.end_ = nullptr;
+            other.full_count_ = 0;
         }
         return *this;
     }
     ~ChunkedVec() { clear_and_free(); }
 
+    void set_cache(ThreadBlockCache* cache) noexcept { cache_ = cache; }
+
     void push_back(const T& item) {
-        if (tail_pos_ == BlockCap) {
-            blocks_.push_back(static_cast<T*>(::operator new[](sizeof(T) * BlockCap)));
-            tail_pos_ = 0;
+        if (__builtin_expect(cur_ == end_, 0)) {
+            grow();
         }
-        blocks_.back()[tail_pos_++] = item;
-        ++count_;
+        *cur_++ = item;
     }
 
-    size_t size() const noexcept { return count_; }
-    bool empty() const noexcept { return count_ == 0; }
+    size_t size() const noexcept {
+        if (blocks_.empty()) return 0;
+        return full_count_ + static_cast<size_t>(cur_ - blocks_.back());
+    }
+
+    bool empty() const noexcept { return blocks_.empty(); }
+
+    size_t num_blocks() const noexcept { return blocks_.size(); }
+
+    T* block_ptr(size_t bi) const noexcept { return blocks_[bi]; }
+
+    size_t block_len(size_t bi) const noexcept {
+        return (bi + 1 < blocks_.size()) ? BlockCap
+                                         : static_cast<size_t>(cur_ - blocks_.back());
+    }
 
     template <typename Fn>
     void for_each_block(Fn&& fn) const {
@@ -419,29 +671,40 @@ class ChunkedVec {
         for (size_t i = 0; i + 1 < nblocks; ++i) {
             fn(blocks_[i], BlockCap);
         }
-        fn(blocks_.back(), tail_pos_);
+        fn(blocks_.back(), static_cast<size_t>(cur_ - blocks_.back()));
     }
 
-    template <typename Fn>
-    void for_each(Fn&& fn) const {
-        for_each_block([&](const T* ptr, size_t n) {
-            for (size_t i = 0; i < n; ++i) {
-                fn(ptr[i]);
-            }
-        });
-    }
-
-    void clear_and_free() noexcept {
+    void free_to(ThreadBlockCache* target_cache) noexcept {
         for (T* b : blocks_) {
-            ::operator delete[](b);
+            if (target_cache) {
+                target_cache->free(b);
+            } else {
+                ::operator delete[](b);
+            }
         }
         std::vector<T*>().swap(blocks_);
-        count_ = 0;
-        tail_pos_ = BlockCap;
+        cur_ = nullptr;
+        end_ = nullptr;
+        full_count_ = 0;
     }
 
+    void clear_and_free() noexcept { free_to(cache_); }
+
    private:
+    __attribute__((noinline)) void grow() {
+        if (!blocks_.empty()) {
+            full_count_ += BlockCap;
+        }
+        T* b = cache_ ? static_cast<T*>(cache_->alloc())
+                      : static_cast<T*>(::operator new[](sizeof(T) * BlockCap));
+        blocks_.push_back(b);
+        cur_ = b;
+        end_ = b + BlockCap;
+    }
+
+    ThreadBlockCache* cache_ = nullptr;
     std::vector<T*> blocks_;
-    size_t count_ = 0;
-    size_t tail_pos_ = BlockCap;
+    T* cur_ = nullptr;
+    T* end_ = nullptr;
+    size_t full_count_ = 0;
 };

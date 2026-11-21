@@ -98,6 +98,41 @@ class Buf {
     void struct_end() { u8(0); }
 };
 
+class FastByteCursor {
+   public:
+    explicit FastByteCursor(size_t initial_cap = 1 << 20)
+        : buf_(initial_cap), cur_(buf_.data()), end_(buf_.data() + buf_.size()) {}
+
+    void clear() noexcept { cur_ = buf_.data(); }
+    const uint8_t* data() const noexcept { return buf_.data(); }
+    size_t size() const noexcept { return static_cast<size_t>(cur_ - buf_.data()); }
+
+    void write_len_str(std::string_view sv) {
+        const uint32_t slen = static_cast<uint32_t>(sv.size());
+        const size_t need = 4 + slen;
+        if (__builtin_expect(static_cast<size_t>(end_ - cur_) < need, 0)) {
+            grow(need);
+        }
+        std::memcpy(cur_, &slen, 4);
+        if (slen > 0) std::memcpy(cur_ + 4, sv.data(), slen);
+        cur_ += need;
+    }
+
+   private:
+    __attribute__((noinline)) void grow(size_t need) {
+        const size_t used = static_cast<size_t>(cur_ - buf_.data());
+        size_t ncap = buf_.size() * 2;
+        while (ncap < used + need) ncap *= 2;
+        buf_.resize(ncap);
+        cur_ = buf_.data() + used;
+        end_ = buf_.data() + ncap;
+    }
+
+    std::vector<uint8_t> buf_;
+    uint8_t* cur_;
+    uint8_t* end_;
+};
+
 enum class ColKind : uint8_t {
     UTF8_REQ,
     UTF8_OPT,
@@ -163,8 +198,6 @@ class RawFile {
     int64_t offset_ = 0;
 };
 
-// Hybrid RLE / Bit-Packed Hybrid encoder for bit_width = 1 definition levels:
-// uses RLE runs for >= 8 identical values, bit-packed chunks (<= 63 groups of 8) otherwise.
 inline void encode_def_levels_bit1(Buf& out, const uint8_t* defs, size_t n) {
     const size_t len_pos = out.size();
     out.le32(0);
@@ -211,16 +244,16 @@ inline void encode_def_levels_bit1(Buf& out, const uint8_t* defs, size_t n) {
 inline void write_page_header(Buf& hdr, int32_t body_len, int32_t num_values) {
     hdr.clear();
     int16_t last = 0;
-    hdr.field_i32(last, 1, 0);         // PageType::DATA_PAGE
-    hdr.field_i32(last, 2, body_len);  // uncompressed_page_size
-    hdr.field_i32(last, 3, body_len);  // compressed_page_size
-    hdr.field_hdr(last, 5, 12);        // data_page_header struct
+    hdr.field_i32(last, 1, 0);
+    hdr.field_i32(last, 2, body_len);
+    hdr.field_i32(last, 3, body_len);
+    hdr.field_hdr(last, 5, 12);
     {
         int16_t dlast = 0;
         hdr.field_i32(dlast, 1, num_values);
-        hdr.field_i32(dlast, 2, 0);  // Encoding::PLAIN
-        hdr.field_i32(dlast, 3, 3);  // definition_level_encoding = RLE
-        hdr.field_i32(dlast, 4, 3);  // repetition_level_encoding = RLE
+        hdr.field_i32(dlast, 2, 0);
+        hdr.field_i32(dlast, 3, 3);
+        hdr.field_i32(dlast, 4, 3);
         hdr.struct_end();
     }
     hdr.struct_end();
@@ -255,20 +288,20 @@ inline void write_footer(RawFile& file, const ColDef* schema, size_t ncols,
         f.field_i32(sl, 3, rep);
         f.field_str(sl, 4, schema[c].name);
         if (k == ColKind::UTF8_REQ || k == ColKind::UTF8_OPT) {
-            f.field_i32(sl, 6, 0);  // ConvertedType::UTF8
+            f.field_i32(sl, 6, 0);
             f.field_hdr(sl, 10, 12);
             {
                 int16_t ll = 0;
-                f.field_hdr(ll, 1, 12);  // STRING = 1
+                f.field_hdr(ll, 1, 12);
                 f.struct_end();
                 f.struct_end();
             }
         } else if (k == ColKind::DATE_REQ) {
-            f.field_i32(sl, 6, 6);  // ConvertedType::DATE
+            f.field_i32(sl, 6, 6);
             f.field_hdr(sl, 10, 12);
             {
                 int16_t ll = 0;
-                f.field_hdr(ll, 6, 12);  // DATE = 6
+                f.field_hdr(ll, 6, 12);
                 f.struct_end();
                 f.struct_end();
             }
@@ -329,34 +362,31 @@ inline void write_footer(RawFile& file, const ColDef* schema, size_t ncols,
 
 class UserDailyParquetWriter {
    public:
-    static constexpr int64_t kRowGroupRows = 250000;
+    static constexpr int64_t kRowGroupRows = 131072;
 
-    explicit UserDailyParquetWriter(const std::string& path) : file_(path) {
-        col_user_.reserve(1 << 20);
-        col_day_.reserve(256 << 10);
-        col_sessions_.reserve(256 << 10);
-        col_events_.reserve(256 << 10);
-        col_revenue_.reserve(512 << 10);
-        def_top_cat_.reserve(65536);
-        vals_top_cat_.reserve(256 << 10);
-    }
+    explicit UserDailyParquetWriter(const std::string& path)
+        : file_(path),
+          col_user_(2 << 20),
+          vals_top_cat_(512 << 10),
+          col_day_(kRowGroupRows),
+          col_sessions_(kRowGroupRows),
+          col_events_(kRowGroupRows),
+          col_revenue_(kRowGroupRows),
+          def_top_cat_(kRowGroupRows) {}
 
     void add_row(std::string_view user_id, int32_t day, int32_t sessions, int32_t events,
                  int64_t revenue_cents, bool has_top_cat, std::string_view top_cat) {
-        const uint32_t ulen = static_cast<uint32_t>(user_id.size());
-        col_user_.le32(ulen);
-        col_user_.bytes(user_id.data(), ulen);
+        col_user_.write_len_str(user_id);
 
-        col_day_.le32(static_cast<uint32_t>(day));
-        col_sessions_.le32(static_cast<uint32_t>(sessions));
-        col_events_.le32(static_cast<uint32_t>(events));
-        col_revenue_.le64(static_cast<uint64_t>(revenue_cents));
+        const size_t i = static_cast<size_t>(rg_rows_);
+        col_day_[i] = day;
+        col_sessions_[i] = sessions;
+        col_events_[i] = events;
+        col_revenue_[i] = revenue_cents;
+        def_top_cat_[i] = has_top_cat ? 1 : 0;
 
-        def_top_cat_.push_back(has_top_cat ? 1 : 0);
         if (has_top_cat) {
-            const uint32_t clen = static_cast<uint32_t>(top_cat.size());
-            vals_top_cat_.le32(clen);
-            vals_top_cat_.bytes(top_cat.data(), clen);
+            vals_top_cat_.write_len_str(top_cat);
         }
 
         ++rg_rows_;
@@ -386,46 +416,43 @@ class UserDailyParquetWriter {
         if (rg_rows_ == 0) return;
         parquet_detail::RowGroupRecord rg;
         rg.num_rows = rg_rows_;
+        const size_t nrows = static_cast<size_t>(rg_rows_);
 
-        auto emit_col = [&](int32_t type, std::string_view name, bool optional,
-                            const parquet_detail::Buf& body) {
-            parquet_detail::write_page_header(hdr_tmp_, static_cast<int32_t>(body.size()),
+        auto emit_raw = [&](int32_t type, std::string_view name, bool optional,
+                            const void* body_ptr, size_t body_len) {
+            parquet_detail::write_page_header(hdr_tmp_, static_cast<int32_t>(body_len),
                                               static_cast<int32_t>(rg_rows_));
             const int64_t off = file_.offset();
             file_.write_raw(hdr_tmp_.data.data(), hdr_tmp_.size());
-            file_.write_raw(body.data.data(), body.size());
-            const int64_t tot = static_cast<int64_t>(hdr_tmp_.size() + body.size());
+            file_.write_raw(body_ptr, body_len);
+            const int64_t tot = static_cast<int64_t>(hdr_tmp_.size() + body_len);
             rg.total_byte_size += tot;
             rg.cols.push_back(parquet_detail::ChunkMeta{type, name, optional, rg_rows_, tot, off});
         };
 
-        emit_col(6, "user_id", false, col_user_);
-        emit_col(1, "day", false, col_day_);
-        emit_col(1, "sessions", false, col_sessions_);
-        emit_col(1, "events", false, col_events_);
-        emit_col(2, "revenue_cents", false, col_revenue_);
+        emit_raw(6, "user_id", false, col_user_.data(), col_user_.size());
+        emit_raw(1, "day", false, col_day_.data(), nrows * 4);
+        emit_raw(1, "sessions", false, col_sessions_.data(), nrows * 4);
+        emit_raw(1, "events", false, col_events_.data(), nrows * 4);
+        emit_raw(2, "revenue_cents", false, col_revenue_.data(), nrows * 8);
 
         body_top_cat_.clear();
-        parquet_detail::encode_def_levels_bit1(body_top_cat_, def_top_cat_.data(),
-                                               def_top_cat_.size());
-        body_top_cat_.bytes(vals_top_cat_.data.data(), vals_top_cat_.size());
-        emit_col(6, "top_category", true, body_top_cat_);
+        parquet_detail::encode_def_levels_bit1(body_top_cat_, def_top_cat_.data(), nrows);
+        body_top_cat_.bytes(vals_top_cat_.data(), vals_top_cat_.size());
+        emit_raw(6, "top_category", true, body_top_cat_.data.data(), body_top_cat_.size());
 
         rgs_.push_back(std::move(rg));
         col_user_.clear();
-        col_day_.clear();
-        col_sessions_.clear();
-        col_events_.clear();
-        col_revenue_.clear();
-        def_top_cat_.clear();
         vals_top_cat_.clear();
         rg_rows_ = 0;
     }
 
     parquet_detail::RawFile file_;
-    parquet_detail::Buf col_user_, col_day_, col_sessions_, col_events_, col_revenue_;
+    parquet_detail::FastByteCursor col_user_, vals_top_cat_;
+    std::vector<int32_t> col_day_, col_sessions_, col_events_;
+    std::vector<int64_t> col_revenue_;
     std::vector<uint8_t> def_top_cat_;
-    parquet_detail::Buf vals_top_cat_, body_top_cat_, hdr_tmp_;
+    parquet_detail::Buf body_top_cat_, hdr_tmp_;
     std::vector<parquet_detail::RowGroupRecord> rgs_;
     int64_t rg_rows_ = 0;
     int64_t total_rows_ = 0;

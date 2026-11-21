@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "csv_parse.hpp"
@@ -22,8 +23,6 @@
 
 namespace {
 
-constexpr size_t kDedupBuckets = 512;
-constexpr size_t kPersonShards = 256;
 constexpr int64_t kLateCutoffMs = 86400000LL;
 constexpr int64_t kSessionGapMs = 1800000LL;
 constexpr int64_t kClickReachMs = 7LL * 86400000LL;
@@ -35,15 +34,26 @@ struct Traits;
 
 template <>
 struct Traits<true> {
+    static constexpr size_t kEvBlockCap = 1024;
+    static constexpr size_t kSurvEvBlockCap = 2048;
+    static constexpr size_t kSurvClkBlockCap = 1024;
+    static constexpr size_t kPoolBlockBytes = 49152;  // 48 KB: fits 1024*40B, 2048*24B, 1024*36B
+
     struct RawEvent {
-        uint64_t eid_hash;
-        int64_t ingest_ms;
         CompactStr event_id;
         CompactStr user_id;
-        uint32_t ts_rel;     // relative to event_win_start; kFastTombstone == invalid/late
-        uint32_t price_cat;  // (cat_id << 24) | price_cents (0 iff non-purchase)
+        uint32_t ts_rel;          // kFastTombstone == invalid/late/duplicate-loser
+        int32_t ingest_rel_sec;   // (ingest_ms - event_win_start) / 1000, clamped
+        uint32_t price_cat;       // (cat_id << 24) | price_cents
+        uint32_t eid_hash32;
+
+        bool is_tombstone() const noexcept { return ts_rel == kFastTombstone; }
+        void mark_tombstone() noexcept { ts_rel = kFastTombstone; }
+        bool older_than(const RawEvent& other) const noexcept {
+            return ingest_rel_sec < other.ingest_rel_sec;
+        }
     };
-    static_assert(sizeof(RawEvent) == 48);
+    static_assert(sizeof(RawEvent) == 40);
 
     struct SurvivingEvent {
         CompactStr user_id;
@@ -56,7 +66,7 @@ struct Traits<true> {
     struct SurvivingClick {
         CompactStr user_id;
         CompactStr click_id;
-        uint32_t ts_rel;  // relative to click_win_start
+        uint32_t ts_rel;
         uint32_t camp_id;
         uint32_t person_hash32;
     };
@@ -76,14 +86,27 @@ struct Traits<true> {
 
 template <>
 struct Traits<false> {
+    static constexpr size_t kEvBlockCap = 1024;
+    static constexpr size_t kSurvEvBlockCap = 1024;
+    static constexpr size_t kSurvClkBlockCap = 1024;
+    static constexpr size_t kPoolBlockBytes = 65536;  // 64 KB: fits 1024*56B
+
     struct RawEvent {
         uint64_t eid_hash;
         int64_t ingest_ms;
-        int64_t ts_ms;  // kSlowTombstone == invalid/late
+        int64_t ts_ms;  // kSlowTombstone == invalid/late/duplicate-loser
         CompactStr event_id;
         CompactStr user_id;
         uint32_t price_cents;
         uint32_t cat_id;
+        uint32_t eid_hash32;
+        uint32_t pad;
+
+        bool is_tombstone() const noexcept { return ts_ms == kSlowTombstone; }
+        void mark_tombstone() noexcept { ts_ms = kSlowTombstone; }
+        bool older_than(const RawEvent& other) const noexcept {
+            return ingest_ms < other.ingest_ms;
+        }
     };
 
     struct SurvivingEvent {
@@ -118,13 +141,20 @@ struct Traits<false> {
 };
 
 struct SessionInfo {
-    int64_t start_key;  // ts_rel (FastPack) or ts_ms (!FastPack)
+    int64_t start_key;
     uint64_t rev;
     int32_t day;
     uint8_t has_purch;
 };
 
-struct CampDayAgg {
+struct CampCreditAgg {
+    int32_t sessions = 0;
+    int32_t purchasing_sessions = 0;
+    int64_t revenue_cents = 0;
+};
+static_assert(sizeof(CampCreditAgg) == 16);
+
+struct CampDayFull {
     int32_t sessions = 0;
     int32_t purchasing_sessions = 0;
     int64_t revenue_cents = 0;
@@ -134,7 +164,7 @@ struct CampDayAgg {
 struct CampDayHashMap {
     struct Slot {
         uint64_t key = std::numeric_limits<uint64_t>::max();
-        CampDayAgg agg{};
+        CampDayFull agg{};
     };
     std::vector<Slot> table;
     size_t count = 0;
@@ -152,7 +182,7 @@ struct CampDayHashMap {
         return k;
     }
 
-    CampDayAgg& get(uint32_t camp_id, int32_t day) {
+    CampDayFull& get(uint32_t camp_id, int32_t day) {
         if ((count + 1) * 2 >= table.size()) {
             rehash(table.empty() ? 1024 : table.size() * 2);
         }
@@ -204,7 +234,6 @@ inline void radix_sort_events_u64(uint64_t* arr, size_t n, std::vector<uint64_t>
         for (size_t i = 0; i < n; ++i) {
             ++cnt[(src[i] >> shift) & 0xFFu];
         }
-        // Skip pass if all elements share the same byte
         bool single = false;
         for (size_t b = 0; b < 256; ++b) {
             if (cnt[b] == n) {
@@ -228,6 +257,12 @@ inline void radix_sort_events_u64(uint64_t* arr, size_t n, std::vector<uint64_t>
     if (src != arr) {
         std::memcpy(arr, src, n * sizeof(uint64_t));
     }
+}
+
+inline unsigned log2_pow2(size_t v) noexcept {
+    unsigned r = 0;
+    while ((size_t(1) << r) < v) ++r;
+    return r;
 }
 
 inline size_t parse_ncpu() {
@@ -261,9 +296,9 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
                   const DateLut& date_lut, const std::vector<std::string>& cat_names,
                   uint32_t unknown_cat_id, FlatStrMap<uint32_t>& product_map,
                   const std::vector<CampaignInfo>& campaigns,
-                  FlatStrMap<uint32_t>& campaign_map, const LinkTable& links,
-                  std::chrono::steady_clock::time_point t0,
-                  std::chrono::steady_clock::time_point t1) {
+                  const std::vector<uint32_t>& fast_camp_by_num,
+                  FlatStrMap<uint32_t>& campaign_map,
+                  std::chrono::steady_clock::time_point t0) {
     using T = Traits<FastPack>;
     using RawEv = typename T::RawEvent;
     using SurvEv = typename T::SurvivingEvent;
@@ -272,229 +307,299 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
     using ShardClk = typename T::ShardClick;
 
     const size_t ncpu = pool.size();
+
+    size_t total_ev_bytes = 0;
+    auto ev_files = open_all_pread_files(join_path(data_dir, "events"), &total_ev_bytes);
+    auto ev_chunks = build_pread_chunks(ev_files);
+
+    const size_t est_events = total_ev_bytes / 70;
+    size_t dedup_buckets = 64;
+    if (est_events >= 35000000ULL) dedup_buckets = 2048;
+    else if (est_events >= 12000000ULL) dedup_buckets = 1024;
+    else if (est_events >= 2000000ULL) dedup_buckets = 512;
+    else if (est_events >= 200000ULL) dedup_buckets = 128;
+
+    size_t person_shards = 64;
+    if (est_events >= 35000000ULL) person_shards = 512;
+    else if (est_events >= 2000000ULL) person_shards = 256;
+
+    const unsigned dedup_shift = 64u - log2_pow2(dedup_buckets);
+    const unsigned person_shift = 64u - log2_pow2(person_shards);
+
+    HugeBlockPool block_pool(T::kPoolBlockBytes);
+    std::vector<ThreadBlockCache> caches(ncpu);
+    for (size_t t = 0; t < ncpu; ++t) caches[t].init(&block_pool);
+
     std::vector<OverflowArena> event_arenas(ncpu);
-    std::vector<OverflowArena> user_arenas(ncpu);
+    // Deduplication reads event user IDs while click workers append their own.
+    std::vector<OverflowArena> user_arenas(ncpu * 2);
     std::vector<OverflowArena> click_arenas(ncpu);
 
-    // Phase 2: Parallel scan of events/*.csv using pread + SIMD scanner (no LinkTable lookups here!)
-    std::vector<std::vector<ChunkedVec<RawEv>>> raw_ev_buckets(ncpu);
-    for (size_t t = 0; t < ncpu; ++t) raw_ev_buckets[t].resize(kDedupBuckets);
-    {
-        auto ev_files = open_all_csvs(join_path(data_dir, "events"));
-        auto ev_chunks = build_pread_chunks(ev_files);
-        if (!ev_chunks.empty()) {
-            std::atomic<size_t> next_chunk{0};
-            pool.run([&](size_t tid) {
-                std::vector<char> buf;
-                buf.reserve((size_t(2) << 20) + 65536 + 64);
-                auto& ea = event_arenas[tid];
-                auto& ua = user_arenas[tid];
-                auto& buckets = raw_ev_buckets[tid];
-                const uint16_t aid = static_cast<uint16_t>(tid);
-
-                for (;;) {
-                    const size_t ci = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                    if (ci >= ev_chunks.size()) break;
-                    size_t data_start = 0, limit = 0, blen = 0;
-                    read_chunk_into(ev_chunks[ci], buf, data_start, limit, blen);
-                    if (data_start >= limit) continue;
-
-                    for_each_csv_line<7>(
-                        buf.data(), data_start, limit, blen, [&](const std::string_view (&f)[7]) {
-                            if (f[0].empty()) return;
-
-                            int64_t ingest_ms = 0;
-                            if (!parse_ts_f1_fast(f[3], date_lut, ingest_ms)) return;
-
-                            uint64_t eh = wyhash64(f[0]);
-                            if (eh == 0) eh = 1;
-                            const size_t b = static_cast<size_t>(eh >> 55);
-
-                            bool valid = !f[1].empty() && !f[5].empty();
-                            int64_t ts_ms = 0;
-                            if (valid) {
-                                valid = parse_ts_any_fast(f[2], date_lut, ts_ms) &&
-                                        ts_ms >= event_win_start && ts_ms < event_win_end &&
-                                        (ingest_ms - ts_ms) <= kLateCutoffMs;
-                            }
-
-                            uint32_t price_cents = 0;
-                            uint32_t cat_id = 0;
-                            if (valid) {
-                                const std::string_view et = f[4];
-                                if (et == "view" || et == "cart") {
-                                    price_cents = 0;
-                                } else if (et == "purchase") {
-                                    valid = parse_price_cents(f[6], price_cents);
-                                    if (valid) {
-                                        const uint32_t* pc = product_map.find(f[5]);
-                                        cat_id = pc ? *pc : unknown_cat_id;
-                                    }
-                                } else {
-                                    valid = false;
-                                }
-                            }
-
-                            RawEv re{};
-                            re.eid_hash = eh;
-                            re.ingest_ms = ingest_ms;
-                            re.event_id = CompactStr::make_str(f[0], aid, ea);
-                            if (valid) {
-                                re.user_id = CompactStr::make_str(f[1], aid, ua);
-                                if constexpr (FastPack) {
-                                    re.ts_rel = static_cast<uint32_t>(ts_ms - event_win_start);
-                                    re.price_cat = (cat_id << 24) | price_cents;
-                                } else {
-                                    re.ts_ms = ts_ms;
-                                    re.price_cents = price_cents;
-                                    re.cat_id = cat_id;
-                                }
-                            } else {
-                                if constexpr (FastPack) {
-                                    re.ts_rel = kFastTombstone;
-                                } else {
-                                    re.ts_ms = kSlowTombstone;
-                                }
-                            }
-                            buckets[b].push_back(re);
-                        });
-                }
-            });
-        }
+    std::vector<std::vector<ChunkedVec<RawEv, T::kEvBlockCap>>> raw_ev_buckets(ncpu);
+    for (size_t t = 0; t < ncpu; ++t) {
+        raw_ev_buckets[t].resize(dedup_buckets);
+        for (size_t b = 0; b < dedup_buckets; ++b) raw_ev_buckets[t][b].set_cache(&caches[t]);
     }
-    product_map.clear_and_free();
-    const auto t2 = std::chrono::steady_clock::now();
 
-    // Phase 3: Parallel event_id dedup across 512 buckets + prefetched LinkTable resolution -> 256 shards
-    std::vector<std::vector<ChunkedVec<SurvEv>>> ev_person_buckets(ncpu);
-    for (size_t t = 0; t < ncpu; ++t) ev_person_buckets[t].resize(kPersonShards);
-    {
-        std::atomic<size_t> next_bucket{0};
+    // Phase 1: Parallel 32-shard LinkTable build across all cores
+    LinkTable links;
+    links.build(join_path(data_dir, "links"), pool, caches);
+    const auto t_links = std::chrono::steady_clock::now();
+
+    // Phase 2: Scan events/*.csv across all cores with 1 MB pread chunks
+    if (!ev_chunks.empty()) {
+        std::atomic<size_t> next_ev_chunk{0};
         pool.run([&](size_t tid) {
-            const OverflowArena* ea_ptr = event_arenas.data();
-            const OverflowArena* ua_ptr = user_arenas.data();
-            auto& out_buckets = ev_person_buckets[tid];
-            std::vector<RawEv> flat_evs;
-            std::vector<DedupIdx> idx_table;
-            struct SurvTmp {
-                uint32_t ev_idx;
-                uint64_t uh;
-            };
-            std::vector<SurvTmp> surv_tmp;
+            std::vector<char> buf;
+            buf.reserve((size_t(1) << 20) + 65536 + 64);
+            auto& ea = event_arenas[tid];
+            auto& ua = user_arenas[tid];
+            auto& buckets = raw_ev_buckets[tid];
+            const uint16_t aid = static_cast<uint16_t>(tid);
 
             for (;;) {
-                const size_t b = next_bucket.fetch_add(1, std::memory_order_relaxed);
-                if (b >= kDedupBuckets) break;
+                const size_t ci = next_ev_chunk.fetch_add(1, std::memory_order_relaxed);
+                if (ci >= ev_chunks.size()) break;
+                size_t data_start = 0, limit = 0, blen = 0;
+                read_chunk_into(ev_chunks[ci], buf, data_start, limit, blen);
+                if (data_start >= limit) continue;
 
-                size_t total = 0;
-                for (size_t t = 0; t < ncpu; ++t) total += raw_ev_buckets[t][b].size();
-                if (total == 0) continue;
+                for_each_csv_line<7>(
+                    buf.data(), data_start, limit, blen, [&](const std::string_view (&f)[7]) {
+                        if (f[0].empty()) return;
 
-                flat_evs.clear();
-                flat_evs.reserve(total);
-                for (size_t t = 0; t < ncpu; ++t) {
-                    raw_ev_buckets[t][b].for_each_block([&](const RawEv* ptr, size_t n) {
-                        flat_evs.insert(flat_evs.end(), ptr, ptr + n);
-                    });
-                    raw_ev_buckets[t][b].clear_and_free();
-                }
+                        int64_t ingest_ms = 0;
+                        if (!parse_ts_f1_fast(f[3], date_lut, ingest_ms)) return;
 
-                size_t cap = 64;
-                while (cap * 11 < total * 20) cap <<= 1;
-                idx_table.assign(cap, DedupIdx{});
-                const size_t mask = cap - 1;
+                        const CompactStr eid = CompactStr::make_str(f[0], aid, ea);
+                        const uint64_t eh = fast_compact_hash(eid, event_arenas.data());
+                        const size_t b = static_cast<size_t>(eh >> dedup_shift);
 
-                for (size_t i = 0; i < total; ++i) {
-                    const RawEv& re = flat_evs[i];
-                    const uint32_t h32 = static_cast<uint32_t>(re.eid_hash);
-                    size_t slot = static_cast<size_t>(re.eid_hash) & mask;
-                    for (;;) {
-                        DedupIdx& sl = idx_table[slot];
-                        if (sl.idx_plus1 == 0) {
-                            sl.idx_plus1 = static_cast<uint32_t>(i + 1);
-                            sl.hash32 = h32;
-                            break;
+                        bool valid = !f[1].empty() && !f[5].empty();
+                        int64_t ts_ms = 0;
+                        if (valid) {
+                            valid = parse_ts_any_fast(f[2], date_lut, ts_ms) &&
+                                    ts_ms >= event_win_start && ts_ms < event_win_end &&
+                                    (ingest_ms - ts_ms) <= kLateCutoffMs;
                         }
-                        if (sl.hash32 == h32 &&
-                            CompactStr::raw_equals(flat_evs[sl.idx_plus1 - 1].event_id,
-                                                   re.event_id, ea_ptr)) {
-                            if (re.ingest_ms < flat_evs[sl.idx_plus1 - 1].ingest_ms) {
-                                sl.idx_plus1 = static_cast<uint32_t>(i + 1);
+
+                        uint32_t price_cents = 0;
+                        uint32_t cat_id = 0;
+                        if (valid) {
+                            const std::string_view et = f[4];
+                            switch (et.size()) {
+                                case 4:
+                                    if (std::memcmp(et.data(), "view", 4) != 0 &&
+                                        std::memcmp(et.data(), "cart", 4) != 0) {
+                                        valid = false;
+                                    }
+                                    break;
+                                case 8:
+                                    if (std::memcmp(et.data(), "purchase", 8) == 0) {
+                                        valid = parse_price_cents(f[6], price_cents);
+                                        if (valid) {
+                                            const uint32_t* pc = product_map.find(f[5]);
+                                            cat_id = pc ? *pc : unknown_cat_id;
+                                        }
+                                    } else {
+                                        valid = false;
+                                    }
+                                    break;
+                                default:
+                                    valid = false;
+                                    break;
                             }
-                            break;
                         }
-                        slot = (slot + 1) & mask;
-                    }
-                }
 
-                surv_tmp.clear();
-                surv_tmp.reserve(total);
-                for (const DedupIdx& sl : idx_table) {
-                    if (sl.idx_plus1 == 0) continue;
-                    const uint32_t eidx = sl.idx_plus1 - 1;
-                    const RawEv& re = flat_evs[eidx];
-                    if constexpr (FastPack) {
-                        if (re.ts_rel == kFastTombstone) continue;
-                    } else {
-                        if (re.ts_ms == kSlowTombstone) continue;
-                    }
-                    uint64_t uh = wyhash64(re.user_id.raw_view(ua_ptr));
-                    if (uh == 0) uh = 1;
-                    surv_tmp.push_back(SurvTmp{eidx, uh});
-                }
-
-                const size_t nsurv = surv_tmp.size();
-                const bool has_links = !links.empty();
-                for (size_t i = 0; i < nsurv; ++i) {
-                    if (has_links && i + 16 < nsurv) {
-                        links.prefetch(surv_tmp[i + 16].uh);
-                    }
-                    const RawEv& re = flat_evs[surv_tmp[i].ev_idx];
-                    const uint64_t uh = surv_tmp[i].uh;
-                    CompactStr uid = re.user_id;
-                    uint64_t ph = uh;
-                    if (has_links) {
-                        uint32_t canon_id = 0;
-                        if (links.resolve_with_hash(re.user_id, uh, canon_id, ua_ptr)) {
-                            uid = CompactStr::make_linked(canon_id);
-                            ph = links.canonical_hash(canon_id);
-                            if (ph == 0) ph = 1;
+                        RawEv re{};
+                        re.event_id = eid;
+                        re.eid_hash32 = static_cast<uint32_t>(eh);
+                        if constexpr (FastPack) {
+                            int64_t sec = (ingest_ms - event_win_start) / 1000LL;
+                            if (sec < std::numeric_limits<int32_t>::min())
+                                sec = std::numeric_limits<int32_t>::min();
+                            else if (sec > std::numeric_limits<int32_t>::max())
+                                sec = std::numeric_limits<int32_t>::max();
+                            re.ingest_rel_sec = static_cast<int32_t>(sec);
+                            if (valid) {
+                                re.user_id = CompactStr::make_str(f[1], aid, ua);
+                                re.ts_rel = static_cast<uint32_t>(ts_ms - event_win_start);
+                                re.price_cat = (cat_id << 24) | price_cents;
+                            } else {
+                                re.ts_rel = kFastTombstone;
+                            }
+                        } else {
+                            re.eid_hash = eh;
+                            re.ingest_ms = ingest_ms;
+                            if (valid) {
+                                re.user_id = CompactStr::make_str(f[1], aid, ua);
+                                re.ts_ms = ts_ms;
+                                re.price_cents = price_cents;
+                                re.cat_id = cat_id;
+                            } else {
+                                re.ts_ms = kSlowTombstone;
+                            }
                         }
-                    }
-                    if constexpr (FastPack) {
-                        uint32_t ph32 = static_cast<uint32_t>(ph);
-                        if (ph32 == 0) ph32 = 1;
-                        out_buckets[static_cast<size_t>(ph >> 56)].push_back(
-                            SurvEv{uid, re.ts_rel, re.price_cat, ph32});
-                    } else {
-                        out_buckets[static_cast<size_t>(ph >> 56)].push_back(
-                            SurvEv{uid, re.price_cents, re.ts_ms, ph, re.cat_id, 0});
-                    }
-                }
+                        buckets[b].push_back(re);
+                    });
             }
         });
     }
-    std::vector<std::vector<ChunkedVec<RawEv>>>().swap(raw_ev_buckets);
-    for (auto& ea : event_arenas) ea.free_all();
-    std::vector<OverflowArena>().swap(event_arenas);
-    const auto t3 = std::chrono::steady_clock::now();
+    ev_chunks.clear();
+    ev_files.clear();
+    product_map.clear_and_free();
+    const auto t_phase_a = std::chrono::steady_clock::now();
 
-    // Phase 4: Parallel scan of clicks/*.csv with pread + SIMD + 16-ahead LinkTable prefetch
-    std::vector<std::vector<ChunkedVec<SurvClk>>> clk_person_buckets(ncpu);
-    for (size_t t = 0; t < ncpu; ++t) clk_person_buckets[t].resize(kPersonShards);
+    // Phase B: Overlap zero-copy sequential dedup (128..1024 buckets) with clicks/*.csv scan
+    std::vector<std::vector<ChunkedVec<SurvEv, T::kSurvEvBlockCap>>> ev_person_buckets(ncpu);
+    std::vector<std::vector<ChunkedVec<SurvClk, T::kSurvClkBlockCap>>> clk_person_buckets(ncpu);
+    for (size_t t = 0; t < ncpu; ++t) {
+        ev_person_buckets[t].resize(person_shards);
+        clk_person_buckets[t].resize(person_shards);
+        for (size_t s = 0; s < person_shards; ++s) {
+            ev_person_buckets[t][s].set_cache(&caches[t]);
+            clk_person_buckets[t][s].set_cache(&caches[t]);
+        }
+    }
+
+    auto clk_files = open_all_pread_files(join_path(data_dir, "clicks"));
+    auto clk_chunks = build_pread_chunks(clk_files);
+    const size_t clk_starter_threads = clk_chunks.empty() ? 0 : (ncpu > 4 ? 2 : 1);
+    const bool has_links = !links.empty();
+
     {
-        auto clk_files = open_all_csvs(join_path(data_dir, "clicks"));
-        auto clk_chunks = build_pread_chunks(clk_files);
-        if (!clk_chunks.empty()) {
-            std::atomic<size_t> next_chunk{0};
-            pool.run([&](size_t tid) {
+        std::atomic<size_t> next_dedup_b{0};
+        std::atomic<size_t> next_clk_chunk{0};
+
+        pool.run([&](size_t tid) {
+            const OverflowArena* ea_ptr = event_arenas.data();
+            const OverflowArena* ua_ptr = user_arenas.data();
+            auto& my_cache = caches[tid];
+            auto& out_ev_buckets = ev_person_buckets[tid];
+            auto& out_clk_buckets = clk_person_buckets[tid];
+            auto& ua = user_arenas[ncpu + tid];
+            auto& ca = click_arenas[tid];
+            const uint16_t aid = static_cast<uint16_t>(tid);
+
+            struct BlockRef {
+                RawEv* ptr;
+                uint32_t len;
+            };
+            std::vector<BlockRef> block_refs;
+            std::vector<DedupIdx> idx_table;
+            auto run_dedup = [&]() {
+                for (;;) {
+                    const size_t b = next_dedup_b.fetch_add(1, std::memory_order_relaxed);
+                    if (b >= dedup_buckets) break;
+
+                    block_refs.clear();
+                    size_t total = 0;
+                    for (size_t t = 0; t < ncpu; ++t) {
+                        auto& cv = raw_ev_buckets[t][b];
+                        const size_t nb = cv.num_blocks();
+                        for (size_t bi = 0; bi < nb; ++bi) {
+                            const uint32_t blen = static_cast<uint32_t>(cv.block_len(bi));
+                            if (blen > 0) {
+                                block_refs.push_back(BlockRef{cv.block_ptr(bi), blen});
+                                total += blen;
+                            }
+                        }
+                    }
+                    if (total == 0) continue;
+
+                    size_t cap = 64;
+                    while (cap * 11 < total * 20) cap <<= 1;
+                    idx_table.assign(cap, DedupIdx{});
+                    const size_t mask = cap - 1;
+
+                    const uint32_t nrefs = static_cast<uint32_t>(block_refs.size());
+                    for (uint32_t bi = 0; bi < nrefs; ++bi) {
+                        RawEv* const ptr = block_refs[bi].ptr;
+                        const uint32_t blen = block_refs[bi].len;
+                        for (uint32_t i = 0; i < blen; ++i) {
+                            if (i + 16 < blen) {
+                                __builtin_prefetch(&idx_table[ptr[i + 16].eid_hash32 & mask], 1, 1);
+                            }
+                            RawEv& re = ptr[i];
+                            const uint32_t h32 = re.eid_hash32;
+                            const uint32_t code = (bi << 10) | i;
+                            size_t slot = static_cast<size_t>(h32) & mask;
+                            for (;;) {
+                                DedupIdx& sl = idx_table[slot];
+                                if (sl.idx_plus1 == 0) {
+                                    sl.idx_plus1 = code + 1;
+                                    sl.hash32 = h32;
+                                    break;
+                                }
+                                if (sl.hash32 == h32) {
+                                    const uint32_t bcode = sl.idx_plus1 - 1;
+                                    RawEv& best = block_refs[bcode >> 10].ptr[bcode & 1023u];
+                                    if (CompactStr::raw_equals(best.event_id, re.event_id, ea_ptr)) {
+                                        if (re.older_than(best)) {
+                                            best.mark_tombstone();
+                                            sl.idx_plus1 = code + 1;
+                                        } else {
+                                            re.mark_tombstone();
+                                        }
+                                        break;
+                                    }
+                                }
+                                slot = (slot + 1) & mask;
+                            }
+                        }
+                    }
+
+                    // Keep the hashed survivors in L1 while their link lookups are in flight.
+                    constexpr size_t batch_size = 32;
+                    for (const BlockRef& block : block_refs) {
+                        for (size_t start = 0; start < block.len; start += batch_size) {
+                            const RawEv* survivors[batch_size];
+                            uint64_t hashes[batch_size];
+                            size_t count = 0;
+                            const size_t end = std::min(start + batch_size, size_t(block.len));
+                            for (size_t i = start; i < end; ++i) {
+                                const RawEv& re = block.ptr[i];
+                                if (re.is_tombstone()) continue;
+                                const uint64_t h = fast_compact_hash(re.user_id, ua_ptr);
+                                if (has_links) links.prefetch(h);
+                                survivors[count] = &re;
+                                hashes[count++] = h;
+                            }
+                            for (size_t i = 0; i < count; ++i) {
+                                const RawEv& re = *survivors[i];
+                                const uint64_t uh = hashes[i];
+                                CompactStr uid = re.user_id;
+                                uint64_t ph = uh;
+                                if (has_links) {
+                                    uint32_t canon_id = 0;
+                                    if (links.resolve_with_hash(re.user_id, uh, canon_id, ua_ptr)) {
+                                        uid = CompactStr::make_linked(canon_id);
+                                        ph = links.canonical_hash(canon_id);
+                                    }
+                                }
+                                if constexpr (FastPack) {
+                                    uint32_t ph32 = static_cast<uint32_t>(ph);
+                                    if (ph32 == 0) ph32 = 1;
+                                    out_ev_buckets[static_cast<size_t>(ph >> person_shift)].push_back(
+                                        SurvEv{uid, re.ts_rel, re.price_cat, ph32});
+                                } else {
+                                    out_ev_buckets[static_cast<size_t>(ph >> person_shift)].push_back(
+                                        SurvEv{uid, re.price_cents, re.ts_ms, ph, re.cat_id, 0});
+                                }
+                            }
+                        }
+                    }
+
+                    for (size_t t = 0; t < ncpu; ++t) {
+                        raw_ev_buckets[t][b].free_to(&my_cache);
+                    }
+                }
+            };
+
+            auto run_clicks = [&]() {
+                if (clk_chunks.empty()) return;
                 std::vector<char> buf;
-                buf.reserve((size_t(2) << 20) + 65536 + 64);
-                auto& ua = user_arenas[tid];
-                auto& ca = click_arenas[tid];
-                auto& buckets = clk_person_buckets[tid];
-                const uint16_t aid = static_cast<uint16_t>(tid);
-                const bool has_links = !links.empty();
+                buf.reserve((size_t(1) << 20) + 65536 + 64);
 
                 struct PendingClk {
                     int64_t ts_ms;
@@ -515,27 +620,49 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
                         if (has_links && links.resolve_sv_with_hash(pc.uid, pc.uh, canon_id)) {
                             uid = CompactStr::make_linked(canon_id);
                             ph = links.canonical_hash(canon_id);
-                            if (ph == 0) ph = 1;
                         } else {
-                            uid = CompactStr::make_str(pc.uid, aid, ua);
+                            uid = CompactStr::make_str(pc.uid, static_cast<uint16_t>(ncpu + tid), ua);
                         }
                         const CompactStr kid = CompactStr::make_str(pc.kid, aid, ca);
                         if constexpr (FastPack) {
                             uint32_t ph32 = static_cast<uint32_t>(ph);
                             if (ph32 == 0) ph32 = 1;
-                            buckets[static_cast<size_t>(ph >> 56)].push_back(SurvClk{
-                                uid, kid, static_cast<uint32_t>(pc.ts_ms - click_win_start),
-                                pc.camp_id, ph32});
+                            out_clk_buckets[static_cast<size_t>(ph >> person_shift)].push_back(
+                                SurvClk{uid, kid, static_cast<uint32_t>(pc.ts_ms - click_win_start),
+                                        pc.camp_id, ph32});
                         } else {
-                            buckets[static_cast<size_t>(ph >> 56)].push_back(
+                            out_clk_buckets[static_cast<size_t>(ph >> person_shift)].push_back(
                                 SurvClk{pc.ts_ms, ph, uid, kid, pc.camp_id, 0});
                         }
                     }
                     bsz = 0;
                 };
 
+                auto lookup_camp = [&](std::string_view sv) -> uint32_t {
+                    if (sv.size() >= 3 && sv[0] == 'c' && sv[1] == '_' &&
+                        static_cast<uint8_t>(sv[2] - '1') <= 8) {
+                        uint64_t num = static_cast<uint64_t>(sv[2] - '0');
+                        bool is_canon = true;
+                        for (size_t i = 3; i < sv.size(); ++i) {
+                            const uint8_t d = static_cast<uint8_t>(sv[i] - '0');
+                            if (d > 9 || num > 1000000ULL) {
+                                is_canon = false;
+                                break;
+                            }
+                            num = num * 10 + d;
+                        }
+                        if (is_canon) {
+                            return (num < fast_camp_by_num.size())
+                                       ? fast_camp_by_num[num]
+                                       : std::numeric_limits<uint32_t>::max();
+                        }
+                    }
+                    const uint32_t* p = campaign_map.find(sv);
+                    return p ? *p : std::numeric_limits<uint32_t>::max();
+                };
+
                 for (;;) {
-                    const size_t ci = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                    const size_t ci = next_clk_chunk.fetch_add(1, std::memory_order_relaxed);
                     if (ci >= clk_chunks.size()) break;
                     size_t data_start = 0, limit = 0, blen = 0;
                     read_chunk_into(clk_chunks[ci], buf, data_start, limit, blen);
@@ -544,8 +671,8 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
                     for_each_csv_line<4>(
                         buf.data(), data_start, limit, blen, [&](const std::string_view (&f)[4]) {
                             if (f[0].empty() || f[1].empty()) return;
-                            const uint32_t* cid = campaign_map.find(f[2]);
-                            if (!cid) return;
+                            const uint32_t cid = lookup_camp(f[2]);
+                            if (cid == std::numeric_limits<uint32_t>::max()) return;
 
                             int64_t ts_ms = 0;
                             if (!parse_ts_any_fast(f[3], date_lut, ts_ms) ||
@@ -553,25 +680,35 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
                                 return;
                             }
 
-                            uint64_t uh = wyhash64(f[1]);
-                            if (uh == 0) uh = 1;
+                            const uint64_t uh = fast_str_hash(f[1]);
                             if (has_links) links.prefetch(uh);
-                            batch[bsz++] = PendingClk{ts_ms, uh, f[0], f[1], *cid};
+                            batch[bsz++] = PendingClk{ts_ms, uh, f[0], f[1], cid};
                             if (bsz == 16) flush_batch();
                         });
                     flush_batch();
                 }
-            });
-        }
-    }
-    campaign_map.clear_and_free();
-    const auto t4 = std::chrono::steady_clock::now();
+            };
 
-    // Phase 5: Parallel processing of 256 person shards (LPT descending order)
-    std::vector<size_t> shard_order(kPersonShards);
+            if (tid < clk_starter_threads) {
+                run_clicks();
+                run_dedup();
+            } else {
+                run_dedup();
+                run_clicks();
+            }
+        });
+    }
+    clk_chunks.clear();
+    clk_files.clear();
+    campaign_map.clear_and_free();
+    for (auto& ea : event_arenas) ea.free_all();
+    const auto t_phase_b = std::chrono::steady_clock::now();
+
+    // Phase C: Parallel processing of person shards (LPT descending) with separate L2 int32 assists
+    std::vector<size_t> shard_order(person_shards);
     std::iota(shard_order.begin(), shard_order.end(), 0);
-    std::vector<size_t> shard_load(kPersonShards, 0);
-    for (size_t s = 0; s < kPersonShards; ++s) {
+    std::vector<size_t> shard_load(person_shards, 0);
+    for (size_t s = 0; s < person_shards; ++s) {
         size_t load = 0;
         for (size_t t = 0; t < ncpu; ++t) {
             load += ev_person_buckets[t][s].size() + clk_person_buckets[t][s].size();
@@ -591,14 +728,18 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
         use_flat_camp ? (num_camps * static_cast<size_t>(num_days_i64)) : 0;
 
     struct ThreadAgg {
-        std::vector<CampDayAgg> flat;
+        std::vector<CampCreditAgg> flat_credits;
+        std::vector<int32_t> flat_assists;
         CampDayHashMap map;
         int64_t total_sessions = 0;
         int64_t total_revenue = 0;
     };
     std::vector<ThreadAgg> thread_aggs(ncpu);
     for (size_t t = 0; t < ncpu; ++t) {
-        if (use_flat_camp) thread_aggs[t].flat.resize(flat_camp_size);
+        if (use_flat_camp) {
+            thread_aggs[t].flat_credits.resize(flat_camp_size);
+            thread_aggs[t].flat_assists.resize(flat_camp_size, 0);
+        }
     }
 
     {
@@ -606,6 +747,7 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
         pool.run([&](size_t tid) {
             const OverflowArena* ua_ptr = user_arenas.data();
             const OverflowArena* ca_ptr = click_arenas.data();
+            auto& my_cache = caches[tid];
             auto& agg = thread_aggs[tid];
 
             const std::string out_path =
@@ -614,22 +756,29 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
             UserDailyParquetWriter writer(out_path);
 
             auto add_credit = [&](uint32_t camp_id, int32_t day, uint8_t has_purch, uint64_t rev) {
-                CampDayAgg& cd =
-                    use_flat_camp
-                        ? agg.flat[static_cast<size_t>(camp_id) * static_cast<size_t>(num_days_i64) +
-                                   static_cast<size_t>(day - day_start)]
-                        : agg.map.get(camp_id, day);
-                ++cd.sessions;
-                cd.purchasing_sessions += has_purch;
-                cd.revenue_cents += static_cast<int64_t>(rev);
+                if (use_flat_camp) {
+                    CampCreditAgg& cd =
+                        agg.flat_credits[static_cast<size_t>(camp_id) *
+                                             static_cast<size_t>(num_days_i64) +
+                                         static_cast<size_t>(day - day_start)];
+                    ++cd.sessions;
+                    cd.purchasing_sessions += has_purch;
+                    cd.revenue_cents += static_cast<int64_t>(rev);
+                } else {
+                    CampDayFull& cd = agg.map.get(camp_id, day);
+                    ++cd.sessions;
+                    cd.purchasing_sessions += has_purch;
+                    cd.revenue_cents += static_cast<int64_t>(rev);
+                }
             };
             auto add_assist = [&](uint32_t camp_id, int32_t day) {
-                CampDayAgg& cd =
-                    use_flat_camp
-                        ? agg.flat[static_cast<size_t>(camp_id) * static_cast<size_t>(num_days_i64) +
-                                   static_cast<size_t>(day - day_start)]
-                        : agg.map.get(camp_id, day);
-                ++cd.assisted_sessions;
+                if (use_flat_camp) {
+                    ++agg.flat_assists[static_cast<size_t>(camp_id) *
+                                           static_cast<size_t>(num_days_i64) +
+                                       static_cast<size_t>(day - day_start)];
+                } else {
+                    ++agg.map.get(camp_id, day).assisted_sessions;
+                }
             };
 
             std::vector<PersonMapSlot> pmap;
@@ -648,19 +797,20 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
 
             for (;;) {
                 const size_t oi = next_order_idx.fetch_add(1, std::memory_order_relaxed);
-                if (oi >= kPersonShards) break;
+                if (oi >= person_shards) break;
                 const size_t s = shard_order[oi];
 
                 size_t total_ev = 0;
                 for (size_t t = 0; t < ncpu; ++t) total_ev += ev_person_buckets[t][s].size();
                 if (total_ev == 0) {
-                    for (size_t t = 0; t < ncpu; ++t) clk_person_buckets[t][s].clear_and_free();
+                    for (size_t t = 0; t < ncpu; ++t) clk_person_buckets[t][s].free_to(&my_cache);
                     continue;
                 }
 
-                // Single-pass interning + staging for events (zero second hash probe)
                 size_t pcap = 64;
-                while (pcap * 11 < total_ev * 10) pcap <<= 1;
+                // People recur within a shard. Start with a modest estimate and
+                // grow at the usual load factor if the users are mostly distinct.
+                while (pcap < total_ev / 8) pcap <<= 1;
                 if (pcap < 128) pcap = 128;
                 pmap.assign(pcap, PersonMapSlot{});
                 size_t pmask = pcap - 1;
@@ -739,7 +889,7 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
                             }
                         }
                     });
-                    ev_person_buckets[t][s].clear_and_free();
+                    ev_person_buckets[t][s].free_to(&my_cache);
                 }
 
                 const size_t num_persons = pid_user.size();
@@ -752,7 +902,6 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
                     shard_events[ev_cur[tmp_ev_pids[i]]++] = tmp_evs[i];
                 }
 
-                // Single-pass click filtering & staging (zero second hash probe)
                 clk_cnt.assign(num_persons, 0);
                 tmp_clk_pids.clear();
                 tmp_clks.clear();
@@ -779,7 +928,7 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
                             }
                         }
                     });
-                    clk_person_buckets[t][s].clear_and_free();
+                    clk_person_buckets[t][s].free_to(&my_cache);
                 }
 
                 const size_t total_clk = tmp_clks.size();
@@ -792,7 +941,6 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
                     shard_clicks[clk_cur[tmp_clk_pids[i]]++] = tmp_clks[i];
                 }
 
-                // Per-person processing
                 for (size_t p = 0; p < num_persons; ++p) {
                     ShardEv* pev = shard_events.data() + ev_off[p];
                     const size_t nev = ev_off[p + 1] - ev_off[p];
@@ -983,9 +1131,9 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
             writer.finish();
         });
     }
-    const auto t5 = std::chrono::steady_clock::now();
+    const auto t_phase_c = std::chrono::steady_clock::now();
 
-    // Phase 6: Reduce campaign_daily across threads & write campaign_daily/part-0.parquet
+    // Phase D: Reduce campaign_daily across threads & write campaign_daily/part-0.parquet
     CampaignDailyParquetWriter camp_writer(
         join_path(join_path(output_dir, "campaign_daily"), "part-0.parquet"));
     int64_t camp_sessions_sum = 0;
@@ -1001,12 +1149,13 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
             for (int64_t d = 0; d < num_days_i64; ++d) {
                 int32_t sess = 0, purch = 0, assist = 0;
                 int64_t rev = 0;
+                const size_t idx = base + static_cast<size_t>(d);
                 for (size_t t = 0; t < ncpu; ++t) {
-                    const CampDayAgg& a = thread_aggs[t].flat[base + static_cast<size_t>(d)];
-                    sess += a.sessions;
-                    purch += a.purchasing_sessions;
-                    rev += a.revenue_cents;
-                    assist += a.assisted_sessions;
+                    const CampCreditAgg& cr = thread_aggs[t].flat_credits[idx];
+                    sess += cr.sessions;
+                    purch += cr.purchasing_sessions;
+                    rev += cr.revenue_cents;
+                    assist += thread_aggs[t].flat_assists[idx];
                 }
                 if (sess > 0 || assist > 0) {
                     camp_writer.add_row(cid, ch, static_cast<int32_t>(day_start + d), sess, purch,
@@ -1025,7 +1174,7 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
                 if (s.key == std::numeric_limits<uint64_t>::max()) continue;
                 const uint32_t c = static_cast<uint32_t>(s.key >> 32);
                 const int32_t d = static_cast<int32_t>(static_cast<uint32_t>(s.key));
-                CampDayAgg& m = merged.get(c, d);
+                CampDayFull& m = merged.get(c, d);
                 m.sessions += s.agg.sessions;
                 m.purchasing_sessions += s.agg.purchasing_sessions;
                 m.revenue_cents += s.agg.revenue_cents;
@@ -1055,20 +1204,26 @@ void run_pipeline(const std::string& data_dir, const std::string& output_dir, Th
         user_revenue_sum += ta.total_revenue;
     }
 
-    const auto t6 = std::chrono::steady_clock::now();
+    const auto t_end = std::chrono::steady_clock::now();
     auto ms = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
     };
     std::fprintf(stderr,
-                 "done in %.1f ms (links %.1f, events %.1f, dedup %.1f, clicks %.1f, shards %.1f, "
+                 "done in %.1f ms (links %.1f, events %.1f, dedup+clk %.1f, shards %.1f, "
                  "camp %.1f) | sessions=%lld/%lld rev=%lld/%lld assists=%lld>=%lld\n",
-                 ms(t0, t6), ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, t5),
-                 ms(t5, t6), static_cast<long long>(user_sessions_sum),
+                 ms(t0, t_end), ms(t0, t_links), ms(t_links, t_phase_a),
+                 ms(t_phase_a, t_phase_b), ms(t_phase_b, t_phase_c), ms(t_phase_c, t_end),
+                 static_cast<long long>(user_sessions_sum),
                  static_cast<long long>(camp_sessions_sum),
                  static_cast<long long>(user_revenue_sum),
                  static_cast<long long>(camp_revenue_sum),
                  static_cast<long long>(camp_assists_sum),
                  static_cast<long long>(non_organic_sessions_sum));
+    std::fflush(nullptr);
+    if (!std::getenv("SS_PGO_RUN")) {
+        ::_exit(0);
+    }
+    return;
 }
 
 }  // namespace
@@ -1088,7 +1243,6 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(join_path(output_dir, "user_daily"));
     std::filesystem::create_directories(join_path(output_dir, "campaign_daily"));
 
-    // Phase 0: manifest, products, campaigns
     int64_t event_win_start = 0, event_win_end = 0;
     parse_manifest(join_path(data_dir, "manifest.json"), event_win_start, event_win_end);
     const int64_t click_win_start = event_win_start - kClickReachMs;
@@ -1152,6 +1306,7 @@ int main(int argc, char** argv) {
     std::vector<CampaignInfo> campaigns;
     campaigns.push_back({"organic", "organic"});
     FlatStrMap<uint32_t> campaign_map;
+    std::vector<uint32_t> fast_camp_by_num;
     {
         auto cf = read_whole_file(join_path(data_dir, "campaigns.csv"));
         if (!cf.empty()) {
@@ -1168,6 +1323,26 @@ int main(int argc, char** argv) {
                         const uint32_t cid = static_cast<uint32_t>(campaigns.size());
                         if (campaign_map.emplace(f[0], cid).second) {
                             campaigns.push_back({std::string(f[0]), std::string(f[1])});
+                            if (f[0].size() >= 3 && f[0][0] == 'c' && f[0][1] == '_' &&
+                                static_cast<uint8_t>(f[0][2] - '1') <= 8) {
+                                uint64_t num = static_cast<uint64_t>(f[0][2] - '0');
+                                bool is_canon = true;
+                                for (size_t i = 3; i < f[0].size(); ++i) {
+                                    const uint8_t d = static_cast<uint8_t>(f[0][i] - '0');
+                                    if (d > 9 || num > 1000000ULL) {
+                                        is_canon = false;
+                                        break;
+                                    }
+                                    num = num * 10 + d;
+                                }
+                                if (is_canon) {
+                                    if (num >= fast_camp_by_num.size()) {
+                                        fast_camp_by_num.resize(
+                                            num + 1, std::numeric_limits<uint32_t>::max());
+                                    }
+                                    fast_camp_by_num[num] = cid;
+                                }
+                            }
                         }
                     }
                     p = lnl ? (lnl + 1) : end;
@@ -1175,11 +1350,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-
-    // Phase 1: Parallel LinkTable
-    LinkTable links;
-    links.build(join_path(data_dir, "links"), pool);
-    const auto t1 = std::chrono::steady_clock::now();
 
     const bool can_fast_pack =
         (event_win_end > event_win_start) &&
@@ -1190,13 +1360,13 @@ int main(int argc, char** argv) {
     if (can_fast_pack) {
         run_pipeline<true>(data_dir, output_dir, pool, event_win_start, event_win_end,
                            click_win_start, click_win_end, day_start, day_end, date_lut,
-                           cat_names, unknown_cat_id, product_map, campaigns, campaign_map, links,
-                           t0, t1);
+                           cat_names, unknown_cat_id, product_map, campaigns, fast_camp_by_num,
+                           campaign_map, t0);
     } else {
         run_pipeline<false>(data_dir, output_dir, pool, event_win_start, event_win_end,
                             click_win_start, click_win_end, day_start, day_end, date_lut,
-                            cat_names, unknown_cat_id, product_map, campaigns, campaign_map, links,
-                            t0, t1);
+                            cat_names, unknown_cat_id, product_map, campaigns, fast_camp_by_num,
+                            campaign_map, t0);
     }
 
     return 0;
