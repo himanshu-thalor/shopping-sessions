@@ -379,11 +379,17 @@ struct Delimiters {
     return {match64(low, high, ','), match64(low, high, '\n'), match64(low, high, '"')};
 }
 
+SS_AVX512_ATTR [[gnu::always_inline]] inline uint64_t match64_avx512vl(__m256i low, __m256i high, char needle) noexcept {
+    const __m256i target = _mm256_set1_epi8(needle);
+    const uint32_t a = static_cast<uint32_t>(_mm256_cmpeq_epi8_mask(low, target));
+    const uint32_t b = static_cast<uint32_t>(_mm256_cmpeq_epi8_mask(high, target));
+    return a | (static_cast<uint64_t>(b) << 32);
+}
+
 SS_AVX512_ATTR [[gnu::always_inline]] inline Delimiters delimiters_avx512(const char* p) noexcept {
-    const __m512i v = _mm512_loadu_si512(p);
-    return {_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(',')),
-            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('\n')),
-            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('"'))};
+    const __m256i low = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    const __m256i high = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+    return {match64_avx512vl(low, high, ','), match64_avx512vl(low, high, '\n'), match64_avx512vl(low, high, '"')};
 }
 
 template <size_t K, bool EndOfLine>
@@ -472,9 +478,21 @@ template <size_t N>
     if constexpr (N == 2) {
         return read_fields2_32_avx2(p, f);
     } else if constexpr (N == 7) {
-        const size_t first = read_fields_avx2<3, false>(p, f);
-        const size_t last = first ? read_fields_avx2<4, true>(p + first, f + 3) : 0;
-        return last ? (first + last) : 0;
+        const auto d0a = delimiters_avx2(p);
+        const __m256i vc = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 64));
+        const uint64_t c_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(vc, _mm256_set1_epi8(','))));
+        const uint64_t n_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(vc, _mm256_set1_epi8('\n'))));
+        const uint64_t q_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(vc, _mm256_set1_epi8('"'))));
+        const size_t a0 = extract_fields_64<3, false>(d0a, p, f);
+        if (__builtin_expect(a0 > 0 && a0 < 64, 1)) {
+            const unsigned sh = static_cast<unsigned>(64 - a0);
+            const Delimiters d0b{(d0a.commas >> a0) | (c_hi << sh),
+                                 (d0a.newlines >> a0) | (n_hi << sh),
+                                 (d0a.quotes >> a0) | (q_hi << sh)};
+            const size_t b0 = extract_fields_64<4, true>(d0b, p + a0, f + 3);
+            return b0 ? (a0 + b0) : 0;
+        }
+        return 0;
     } else {
         return read_fields_avx2<N, true>(p, f);
     }
@@ -484,9 +502,7 @@ template <size_t N>
 SS_AVX512_ATTR [[gnu::always_inline]] inline size_t read_row_avx512(const char* p,
                                                                     std::string_view* f) noexcept {
     if constexpr (N == 7) {
-        const size_t first = read_fields_avx512<3, false>(p, f);
-        const size_t last = first ? read_fields_avx512<4, true>(p + first, f + 3) : 0;
-        return last ? (first + last) : 0;
+        return read_row_avx2<7>(p, f);
     } else {
         return read_fields_avx512<N, true>(p, f);
     }
@@ -540,14 +556,33 @@ template <size_t N, typename SlowCb>
         const char* p1 = buf + pos1;                                                             \
         size_t u0, u1;                                                                           \
         if constexpr (N == 7) {                                                                  \
-            const auto d0a = DELIM_FN(p0);                                                       \
-            const auto d1a = DELIM_FN(p1);                                                       \
+            const auto d0a = delimiters_avx2(p0);                                                \
+            const auto d1a = delimiters_avx2(p1);                                                \
+            const __m256i v0c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p0 + 64));   \
+            const __m256i v1c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1 + 64));   \
+            const uint64_t c0_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0c, _mm256_set1_epi8(',')))); \
+            const uint64_t n0_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0c, _mm256_set1_epi8('\n')))); \
+            const uint64_t q0_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0c, _mm256_set1_epi8('"')))); \
+            const uint64_t c1_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1c, _mm256_set1_epi8(',')))); \
+            const uint64_t n1_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1c, _mm256_set1_epi8('\n')))); \
+            const uint64_t q1_hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1c, _mm256_set1_epi8('"')))); \
             const size_t a0 = extract_fields_64<3, false>(d0a, p0, f0);                          \
             const size_t a1 = extract_fields_64<3, false>(d1a, p1, f1);                          \
-            const size_t b0 =                                                                    \
-                a0 ? extract_fields_64<4, true>(DELIM_FN(p0 + a0), p0 + a0, f0 + 3) : 0;         \
-            const size_t b1 =                                                                    \
-                a1 ? extract_fields_64<4, true>(DELIM_FN(p1 + a1), p1 + a1, f1 + 3) : 0;         \
+            size_t b0 = 0, b1 = 0;                                                               \
+            if (__builtin_expect(a0 > 0 && a0 < 64, 1)) {                                        \
+                const unsigned sh0 = static_cast<unsigned>(64 - a0);                             \
+                const Delimiters d0b{(d0a.commas >> a0) | (c0_hi << sh0),                        \
+                                     (d0a.newlines >> a0) | (n0_hi << sh0),                      \
+                                     (d0a.quotes >> a0) | (q0_hi << sh0)};                       \
+                b0 = extract_fields_64<4, true>(d0b, p0 + a0, f0 + 3);                           \
+            }                                                                                    \
+            if (__builtin_expect(a1 > 0 && a1 < 64, 1)) {                                        \
+                const unsigned sh1 = static_cast<unsigned>(64 - a1);                             \
+                const Delimiters d1b{(d1a.commas >> a1) | (c1_hi << sh1),                        \
+                                     (d1a.newlines >> a1) | (n1_hi << sh1),                      \
+                                     (d1a.quotes >> a1) | (q1_hi << sh1)};                       \
+                b1 = extract_fields_64<4, true>(d1b, p1 + a1, f1 + 3);                           \
+            }                                                                                    \
             u0 = b0 ? (a0 + b0) : 0;                                                             \
             u1 = b1 ? (a1 + b1) : 0;                                                             \
         } else if constexpr (N == 2) {                                                           \

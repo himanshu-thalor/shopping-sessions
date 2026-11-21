@@ -40,8 +40,8 @@ struct Traits;
 
 template <>
 struct Traits<true> {
-    static constexpr size_t kSurvEvBlockCap = 1024;  // 1024 * 16B = 16 KiB
-    static constexpr size_t kSurvClkBlockCap = 512;  // 512 * 24B = 12 KiB
+    static constexpr size_t kSurvEvBlockCap = 512;  // 1024 * 16B = 16 KiB
+    static constexpr size_t kSurvClkBlockCap = 256;  // 512 * 24B = 12 KiB
 
     struct SurvivingEvent {
         UserId64 user_id;
@@ -72,7 +72,7 @@ struct Traits<true> {
 
 template <>
 struct Traits<false> {
-    static constexpr size_t kSurvEvBlockCap = 512;   // 512 * 24B = 12 KiB
+    static constexpr size_t kSurvEvBlockCap = 256;   // 256 * 24B = 12 KiB
     static constexpr size_t kSurvClkBlockCap = 512;  // 512 * 32B = 16 KiB
 
     struct SurvivingEvent {
@@ -126,32 +126,36 @@ struct SessionBins {
     uint64_t used[max_words]{};
     std::vector<Purchase> purchases;
 
+    void init_empty() noexcept {
+        for (size_t i = 0; i < capacity; ++i) {
+            bins[i] = Bin{UINT32_MAX, 0, 0, UINT32_MAX};
+        }
+    }
+
     template <typename E>
-    [[gnu::always_inline]] uint32_t add(const E* events, size_t count) {
-        uint32_t first_ts = UINT32_MAX;
+    [[gnu::always_inline]] void add(const E* events, size_t count) {
         for (size_t i = 0; i < count; ++i) {
             const uint64_t packed = events[i].packed;
             const uint32_t ts = static_cast<uint32_t>(packed >> 32);
-            if (ts < first_ts) first_ts = ts;
             const uint32_t ix = ts / width;
             Bin& bin = bins[ix];
-            uint64_t& word = used[ix >> 6];
-            const uint64_t bit = uint64_t(1) << (ix & 63u);
-            if (!(word & bit)) {
-                word |= bit;
-                bin = Bin{ts, ts, 1, UINT32_MAX};
-            } else {
-                if (ts < bin.first) bin.first = ts;
-                if (ts > bin.last) bin.last = ts;
-                ++bin.count;
-            }
+            used[ix >> 6] |= (uint64_t(1) << (ix & 63u));
+            if (ts < bin.first) bin.first = ts;
+            if (ts > bin.last) bin.last = ts;
+            ++bin.count;
             const uint32_t pc = static_cast<uint32_t>(packed);
             if (__builtin_expect(pc != 0, 0)) {
                 purchases.push_back(Purchase{pc, bin.purchases});
                 bin.purchases = static_cast<uint32_t>(purchases.size() - 1);
             }
         }
-        return first_ts;
+    }
+
+    [[gnu::always_inline]] uint32_t first_ts(size_t active_words) const noexcept {
+        for (size_t w = 0; w < active_words; ++w) {
+            if (used[w]) return bins[(w << 6) + static_cast<size_t>(__builtin_ctzll(used[w]))].first;
+        }
+        return 0;
     }
 
     template <class Fn>
@@ -159,7 +163,9 @@ struct SessionBins {
         for (size_t w = 0; w < active_words; ++w) {
             uint64_t bits = std::exchange(used[w], 0);
             while (bits) {
-                fn(bins[(w << 6) + static_cast<size_t>(__builtin_ctzll(bits))]);
+                Bin& b = bins[(w << 6) + static_cast<size_t>(__builtin_ctzll(bits))];
+                fn(b);
+                b = Bin{UINT32_MAX, 0, 0, UINT32_MAX};
                 bits &= bits - 1;
             }
         }
@@ -575,10 +581,10 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
 
     const size_t est_events = total_ev_bytes / 72;
     size_t dedup_buckets = 64;
-    if (est_events >= 2000000ULL) dedup_buckets = 512;
+    if (est_events >= 500000ULL) dedup_buckets = 512;
 
     size_t person_shards = 64;
-    if (est_events >= 2000000ULL) person_shards = 512;
+    if (est_events >= 500000ULL) person_shards = 512;
 
     const unsigned dedup_shift = 64u - log2_pow2(dedup_buckets);
     const unsigned person_shift = 64u - log2_pow2(person_shards);
@@ -609,9 +615,9 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
     using Key = EventKey<FastPack>;
     constexpr int32_t indirect_ingest = 1 << 30;
     std::vector<std::vector<int64_t>> long_ingests(ncpu);
-    constexpr unsigned key_shift = FastPack ? 10 : 9;
+    constexpr unsigned key_shift = FastPack ? 9 : 8;
     constexpr uint32_t key_cap = 1u << key_shift;
-    constexpr unsigned payload_shift = FastPack ? 10 : 9;
+    constexpr unsigned payload_shift = FastPack ? 9 : 8;
     static_assert((1u << payload_shift) == T::kSurvEvBlockCap);
 
     std::vector<std::vector<std::vector<BlockSlice<Key>>>> key_buckets(
@@ -811,14 +817,20 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                         const Ref& ref = refs[bi];
                         const Key* const kptr = ref.block.ptr;
                         const uint32_t klen = ref.block.len;
+                        uint32_t hring[8];
+                        const uint32_t pre = std::min<uint32_t>(8u, klen);
+                        for (uint32_t i = 0; i < pre; ++i) {
+                            hring[i] = static_cast<uint32_t>(kptr[i].id.hash(ea_ptrs));
+                        }
                         for (uint32_t i = 0; i < klen; ++i) {
-                            if (i + 8 < klen) {
+                            const uint32_t hash = hring[i & 7u];
+                            if (i + 8u < klen) {
                                 const uint32_t nh =
-                                    static_cast<uint32_t>(kptr[i + 8].id.hash(ea_ptrs));
+                                    static_cast<uint32_t>(kptr[i + 8u].id.hash(ea_ptrs));
+                                hring[i & 7u] = nh;
                                 __builtin_prefetch(&table[nh & mask], 1, 1);
                             }
                             const Key& key = kptr[i];
-                            const uint32_t hash = static_cast<uint32_t>(key.id.hash(ea_ptrs));
                             const uint32_t tag = hash | 1u;
                             const uint32_t code = (bi << key_shift) | i;
                             size_t g = hash & mask;
@@ -954,7 +966,8 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
         use_flat_camp ? (num_camps * static_cast<size_t>(num_days_i64)) : 0;
 
     struct ThreadAgg {
-        std::vector<CampSessAssist> flat_sa;
+        std::vector<int32_t> flat_sess;
+        std::vector<int32_t> flat_assists;
         std::vector<CampPurchRev> flat_pr;
         CampDayHashMap map;
         int64_t total_sessions = 0;
@@ -1009,6 +1022,7 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
             small_camp_state.resize(ncamps);
             camp_state.resize(ncamps);
             camp_epoch.assign(ncamps, 0);
+            bins.init_empty();
         }
     };
     std::vector<WorkerCtx> ctxs(ncpu);
@@ -1025,7 +1039,7 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
             if (use_flat_camp) {
                 const size_t idx =
                     static_cast<size_t>(day - day_start) * num_camps + static_cast<size_t>(camp_id);
-                ++agg.flat_sa[idx].sessions;
+                ++agg.flat_sess[idx];
                 if (__builtin_expect(has_purch != 0, 0)) {
                     ++agg.flat_pr[idx].purchasing_sessions;
                     agg.flat_pr[idx].revenue_cents += static_cast<int64_t>(rev);
@@ -1039,9 +1053,8 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
         };
         auto add_assist_n = [&](uint32_t camp_id, int32_t day, int32_t delta) {
             if (use_flat_camp) {
-                agg.flat_sa[static_cast<size_t>(day - day_start) * num_camps +
-                            static_cast<size_t>(camp_id)]
-                    .assists += delta;
+                agg.flat_assists[static_cast<size_t>(day - day_start) * num_camps +
+                                 static_cast<size_t>(camp_id)] += delta;
             } else {
                 agg.map.get(camp_id, day).assisted_sessions += delta;
             }
@@ -1097,22 +1110,34 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
             if (ts_key - prev_ts > kSessionGapMs) {
                 sessions.push_back(SessionInfo{sess_start, sess_rev, sess_day, sess_purch});
                 sess_start = ts_key;
+                sess_rev = 0;
+                sess_purch = 0;
                 if constexpr (FastPack) {
-                    while (sess_start >= next_day_rel) {
-                        ++sess_day;
-                        next_day_rel += 86400000LL;
+                    if (sess_start >= next_day_rel) {
+                        flush_day();
+                        if (__builtin_expect(sess_start < next_day_rel + 86400000LL, 1)) {
+                            ++sess_day;
+                            next_day_rel += 86400000LL;
+                        } else {
+                            const int64_t d_off = static_cast<int64_t>(
+                                static_cast<uint64_t>(sess_start + day0_off) / 86400000ULL);
+                            sess_day = day_start + static_cast<int32_t>(d_off);
+                            next_day_rel = first_next_day_rel + d_off * 86400000LL;
+                        }
+                        cur_day = sess_day;
+                        day_sessions = 0;
+                        day_events = 0;
+                        day_rev = 0;
                     }
                 } else {
                     sess_day = floor_div_day(sess_start);
-                }
-                sess_rev = 0;
-                sess_purch = 0;
-                if (sess_day != cur_day) {
-                    flush_day();
-                    cur_day = sess_day;
-                    day_sessions = 0;
-                    day_events = 0;
-                    day_rev = 0;
+                    if (sess_day != cur_day) {
+                        flush_day();
+                        cur_day = sess_day;
+                        day_sessions = 0;
+                        day_events = 0;
+                        day_rev = 0;
+                    }
                 }
                 ++day_sessions;
             }
@@ -1231,7 +1256,8 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
             const size_t nsess = sessions.size();
             size_t si = 0;
             if (__builtin_expect(use_flat_camp, 1)) {
-                CampSessAssist* const base_sa = agg.flat_sa.data();
+                int32_t* const base_sess = agg.flat_sess.data();
+                int32_t* const base_assists = agg.flat_assists.data();
                 CampPurchRev* const base_pr = agg.flat_pr.data();
                 while (si < nsess) {
                     const int32_t day = sessions[si].day;
@@ -1241,7 +1267,8 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                     }
                     const uint32_t K = static_cast<uint32_t>(day_end_idx - si);
                     const size_t day_off = static_cast<size_t>(day - day_start) * num_camps;
-                    CampSessAssist* const day_sa = base_sa + day_off;
+                    int32_t* const day_sess = base_sess + day_off;
+                    int32_t* const day_assists = base_assists + day_off;
                     CampPurchRev* const day_pr = base_pr + day_off;
 
                     for (uint32_t k = 0; k < K; ++k) {
@@ -1276,13 +1303,13 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                             auto& st = cstate[c];
                             if (--st.count == 0) {
                                 if (k > st.enter) {
-                                    day_sa[c].assists += static_cast<int32_t>(k - st.enter);
+                                    day_assists[c] += static_cast<int32_t>(k - st.enter);
                                 }
                             }
                             ++l;
                         }
                         const uint32_t credit_camp = (l < r) ? clk_camp_fn(r - 1) : 0u;
-                        ++day_sa[credit_camp].sessions;
+                        ++day_sess[credit_camp];
                         if (__builtin_expect(sess.has_purch != 0, 0)) {
                             ++day_pr[credit_camp].purchasing_sessions;
                             day_pr[credit_camp].revenue_cents += static_cast<int64_t>(sess.rev);
@@ -1293,14 +1320,12 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                     size_t aw = 0;
                     for (size_t ai = 0; ai < nact; ++ai) {
                         if (ai + 4 < nact) {
-                            __builtin_prefetch(&day_sa[active_camps[ai + 4]], 1, 1);
+                            __builtin_prefetch(&day_assists[active_camps[ai + 4]], 1, 1);
                         }
                         const uint32_t ac = active_camps[ai];
                         auto& st = cstate[ac];
                         if (st.count > 0) {
-                            if (K > st.enter) {
-                                day_sa[ac].assists += static_cast<int32_t>(K - st.enter);
-                            }
+                            day_assists[ac] += static_cast<int32_t>(K - st.enter);
                             st.enter = 0;
                             active_camps[aw++] = ac;
                         } else {
@@ -1471,7 +1496,8 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
         if constexpr (FastPack) {
             if (nev >= 96) {
                 ctx.bins.purchases.clear();
-                const int64_t first_key = ctx.bins.add(pev, nev);
+                ctx.bins.add(pev, nev);
+                const int64_t first_key = ctx.bins.first_ts(active_bin_words);
                 run_person_common(tid, uid, true, first_key, nullptr, nev, pclk, nclk);
             } else {
                 sort_u64_hi31(reinterpret_cast<uint64_t*>(pev), nev, ctx.radix_scratch);
@@ -1490,7 +1516,8 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
         std::atomic<size_t> next_shard{0};
         pool.run([&](size_t tid) {
             if (use_flat_camp) {
-                thread_aggs[tid].flat_sa.resize(flat_camp_size);
+                thread_aggs[tid].flat_sess.resize(flat_camp_size);
+                thread_aggs[tid].flat_assists.resize(flat_camp_size);
                 thread_aggs[tid].flat_pr.resize(flat_camp_size);
             }
             writers[tid] = std::make_unique<UserDailyParquetWriter>(join_path(
@@ -1528,7 +1555,7 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                 }
 
                 if (total_ev > 0) {
-                    part.reserve(num_linked_s + total_ev / 32 + 64, arenas);
+                    if (__builtin_expect(part.table.empty(), 0)) part.reserve(total_ev / 32 + 64, arenas);
                     size_t mask = part.table.size() - 1;
                     for (size_t w = 0; w < ncpu; ++w) {
                         for (auto sl : ev_person_buckets[w][s]) {
@@ -1597,7 +1624,7 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                 if (any_clk) {
                     for (auto& e : part.table) {
                         if (e.key.empty()) continue;
-                        clk_off[e.local + 1] = std::exchange(e.count, 0);
+                        clk_off[e.local + 1] = e.count;
                     }
                     for (uint32_t i = 0; i < num_total_s; ++i) clk_off[i + 1] += clk_off[i];
                 }
@@ -1793,13 +1820,12 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                             if (nev >= 96) {
                                 // Zero-copy, zero-sort direct streaming into SessionBins!
                                 ctx.bins.purchases.clear();
-                                uint32_t first_ts = UINT32_MAX;
                                 for (uint32_t si = sb; si < se; ++si) {
                                     const SpanRef& sp = batch_spans[si];
                                     if (!sp.ev_len) continue;
-                                    const uint32_t t = ctx.bins.add(sp.ev_ptr, sp.ev_len);
-                                    if (t < first_ts) first_ts = t;
+                                    ctx.bins.add(sp.ev_ptr, sp.ev_len);
                                 }
+                                const uint32_t first_ts = ctx.bins.first_ts(active_bin_words);
                                 run_person_common(tid, rwork[j].name, true,
                                                   static_cast<int64_t>(first_ts), nullptr, nev,
                                                   pclk, nclk);
@@ -1850,10 +1876,9 @@ void run_pipeline(const std::string& output_dir, ThreadPool& pool,
                 int64_t rev = 0;
                 const size_t idx = base + c;
                 for (size_t t = 0; t < ncpu; ++t) {
-                    const CampSessAssist& sa = thread_aggs[t].flat_sa[idx];
                     const CampPurchRev& pr = thread_aggs[t].flat_pr[idx];
-                    sess += sa.sessions;
-                    assist += sa.assists;
+                    sess += thread_aggs[t].flat_sess[idx];
+                    assist += thread_aggs[t].flat_assists[idx];
                     purch += pr.purchasing_sessions;
                     rev += pr.revenue_cents;
                 }

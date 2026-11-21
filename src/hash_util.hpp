@@ -172,7 +172,7 @@ class HugeBuffer {
 // Per-worker lock-free 16 KiB block allocator backed by 2 MiB-aligned THP slabs.
 class ThreadBlockArena {
    public:
-    static constexpr size_t kBlockBytes = 16384;
+    static constexpr size_t kBlockBytes = 8192;
 
     ThreadBlockArena() = default;
     ThreadBlockArena(const ThreadBlockArena&) = delete;
@@ -514,7 +514,7 @@ struct FastId64 {
 
     [[gnu::always_inline]] inline uint64_t hash(const OverflowArena* const* arenas) const noexcept {
         if (__builtin_expect((raw >> 63) == 0, 1)) {
-            return wyhash_mix(raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
+            return wyhash_mix(raw, 0xe7037ed1a0b428dbull);
         }
         return hash_overflow(arenas);
     }
@@ -522,7 +522,7 @@ struct FastId64 {
     [[gnu::always_inline]] static inline uint64_t hash_sv(std::string_view sv) noexcept {
         FastId64 id = try_inline_safe(sv);
         if (__builtin_expect(id.raw != 0, 1)) {
-            return wyhash_mix(id.raw ^ 0xa0761d6478bd642full, 0xe7037ed1a0b428dbull);
+            return wyhash_mix(id.raw, 0xe7037ed1a0b428dbull);
         }
         return wyhash64(sv);
     }

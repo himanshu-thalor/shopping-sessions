@@ -302,8 +302,8 @@ class LinkTable {
                     continue;
                 }
                 // Reserve ~tot/2 + 64 (leaves headroom for C1 unlinked users without rehashing).
-                part.reserve(tot / 2 + 64, arenas);
-                part.names.reserve(tot / 2 + 64);
+                part.reserve(tot / 2 + 768, arenas);
+                part.names.reserve(tot / 2 + 768);
                 size_t mask = part.table.size() - 1;
                 tmp_ep_loc.clear();
 
@@ -407,6 +407,7 @@ class LinkTable {
                 const uint32_t pr = parent[i + 16];
                 __builtin_prefetch(&parent[pr], 0, 1);
                 __builtin_prefetch(&min_node[pr], 1, 1);
+                __builtin_prefetch(&all_names[min_node[pr]], 0, 1);
             }
             uint32_t r = i;
             while (parent[r] != r) r = parent[r];
