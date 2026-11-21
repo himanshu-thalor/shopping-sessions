@@ -521,7 +521,7 @@ template <size_t N, typename SlowCb>
     size_t pos0 = view.pos;                                                                      \
     const size_t limit = view.limit;                                                             \
     const size_t len = view.len;                                                                 \
-    std::string_view f0[N];                                                                      \
+    std::string_view f0[N], f1[N];                                                               \
     if (limit - pos0 < 8192) {                                                                   \
         SS_SCAN_ONE_LOOP(pos0, limit, READ_ONE_EXPR)                                             \
         return;                                                                                  \
@@ -535,8 +535,6 @@ template <size_t N, typename SlowCb>
     }                                                                                            \
     const size_t lim0 = static_cast<size_t>(mid_nl - buf) + 1;                                   \
     size_t pos1 = lim0;                                                                          \
-    std::string_view batch[8][N];                                                                \
-    size_t nb = 0;                                                                               \
     while (pos0 < lim0 && pos1 < limit) {                                                        \
         const char* p0 = buf + pos0;                                                             \
         const char* p1 = buf + pos1;                                                             \
@@ -544,50 +542,36 @@ template <size_t N, typename SlowCb>
         if constexpr (N == 7) {                                                                  \
             const auto d0a = DELIM_FN(p0);                                                       \
             const auto d1a = DELIM_FN(p1);                                                       \
-            const size_t a0 = extract_fields_64<3, false>(d0a, p0, batch[nb]);                   \
-            const size_t a1 = extract_fields_64<3, false>(d1a, p1, batch[nb + 1]);               \
+            const size_t a0 = extract_fields_64<3, false>(d0a, p0, f0);                          \
+            const size_t a1 = extract_fields_64<3, false>(d1a, p1, f1);                          \
             const size_t b0 =                                                                    \
-                a0 ? extract_fields_64<4, true>(DELIM_FN(p0 + a0), p0 + a0, batch[nb] + 3) : 0;  \
+                a0 ? extract_fields_64<4, true>(DELIM_FN(p0 + a0), p0 + a0, f0 + 3) : 0;         \
             const size_t b1 =                                                                    \
-                a1 ? extract_fields_64<4, true>(DELIM_FN(p1 + a1), p1 + a1, batch[nb + 1] + 3)   \
-                   : 0;                                                                          \
+                a1 ? extract_fields_64<4, true>(DELIM_FN(p1 + a1), p1 + a1, f1 + 3) : 0;         \
             u0 = b0 ? (a0 + b0) : 0;                                                             \
             u1 = b1 ? (a1 + b1) : 0;                                                             \
         } else if constexpr (N == 2) {                                                           \
-            u0 = read_fields2_32_avx2(p0, batch[nb]);                                            \
-            u1 = read_fields2_32_avx2(p1, batch[nb + 1]);                                        \
+            u0 = read_fields2_32_avx2(p0, f0);                                                   \
+            u1 = read_fields2_32_avx2(p1, f1);                                                   \
         } else {                                                                                 \
             const auto d0 = DELIM_FN(p0);                                                        \
             const auto d1 = DELIM_FN(p1);                                                        \
-            u0 = extract_fields_64<N, true>(d0, p0, batch[nb]);                                  \
-            u1 = extract_fields_64<N, true>(d1, p1, batch[nb + 1]);                              \
+            u0 = extract_fields_64<N, true>(d0, p0, f0);                                         \
+            u1 = extract_fields_64<N, true>(d1, p1, f1);                                         \
         }                                                                                        \
-        if (__builtin_expect(u0 != 0 && u1 != 0, 1)) {                                           \
+        if (__builtin_expect(u0 != 0, 1)) {                                                      \
             pos0 += u0;                                                                          \
-            pos1 += u1;                                                                          \
-            nb += 2;                                                                             \
-            if (nb == 8) {                                                                       \
-                for (size_t i = 0; i < 8; ++i) on_fast_row(batch[i]);                            \
-                nb = 0;                                                                          \
-            }                                                                                    \
+            on_fast_row(f0);                                                                     \
         } else {                                                                                 \
-            for (size_t i = 0; i < nb; ++i) on_fast_row(batch[i]);                               \
-            if (u0 != 0) {                                                                       \
-                pos0 += u0;                                                                      \
-                on_fast_row(batch[nb]);                                                          \
-            } else {                                                                             \
-                pos0 += scan_slow_line<N>(p0, len - pos0, on_slow_row);                          \
-            }                                                                                    \
-            if (u1 != 0) {                                                                       \
-                pos1 += u1;                                                                      \
-                on_fast_row(batch[nb + 1]);                                                      \
-            } else {                                                                             \
-                pos1 += scan_slow_line<N>(p1, len - pos1, on_slow_row);                          \
-            }                                                                                    \
-            nb = 0;                                                                              \
+            pos0 += scan_slow_line<N>(p0, len - pos0, on_slow_row);                              \
+        }                                                                                        \
+        if (__builtin_expect(u1 != 0, 1)) {                                                      \
+            pos1 += u1;                                                                          \
+            on_fast_row(f1);                                                                     \
+        } else {                                                                                 \
+            pos1 += scan_slow_line<N>(p1, len - pos1, on_slow_row);                              \
         }                                                                                        \
     }                                                                                            \
-    for (size_t i = 0; i < nb; ++i) on_fast_row(batch[i]);                                       \
     SS_SCAN_ONE_LOOP(pos0, lim0, READ_ONE_EXPR)                                                  \
     SS_SCAN_ONE_LOOP(pos1, limit, READ_ONE_EXPR)
 

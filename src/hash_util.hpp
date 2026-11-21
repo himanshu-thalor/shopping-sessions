@@ -222,6 +222,38 @@ class ThreadBlockArena {
         if (p) free_blocks_.push_back(p);
     }
 
+    // Reuse all already-faulted 2-MiB THP slabs as a zero-fault contiguous bump arena!
+    void reset_to_bump() noexcept {
+        free_blocks_.clear();
+        bump_slab_idx_ = 0;
+        if (!slabs_.empty()) {
+            slab_cur_ = static_cast<char*>(slabs_[0].ptr);
+            slab_end_ = slab_cur_ + slabs_[0].bytes;
+        } else {
+            slab_cur_ = nullptr;
+            slab_end_ = nullptr;
+        }
+    }
+
+    template <typename T>
+    T* bump_alloc(size_t count) {
+        if (count == 0) return nullptr;
+        const size_t bytes = ((count * sizeof(T)) + 63u) & ~size_t(63u);
+        while (__builtin_expect(static_cast<size_t>(slab_end_ - slab_cur_) < bytes, 0)) {
+            if (bump_slab_idx_ + 1 < slabs_.size()) {
+                ++bump_slab_idx_;
+                slab_cur_ = static_cast<char*>(slabs_[bump_slab_idx_].ptr);
+                slab_end_ = slab_cur_ + slabs_[bump_slab_idx_].bytes;
+            } else {
+                alloc_slab(bytes);
+                bump_slab_idx_ = slabs_.size() - 1;
+            }
+        }
+        T* p = reinterpret_cast<T*>(slab_cur_);
+        slab_cur_ += bytes;
+        return p;
+    }
+
     void release_all() noexcept {
         for (const auto& s : slabs_) {
             ::munmap(s.ptr, s.bytes);
@@ -230,6 +262,7 @@ class ThreadBlockArena {
         std::vector<void*>().swap(free_blocks_);
         slab_cur_ = nullptr;
         slab_end_ = nullptr;
+        bump_slab_idx_ = 0;
     }
 
    private:
@@ -238,10 +271,13 @@ class ThreadBlockArena {
         size_t bytes;
     };
 
-    __attribute__((noinline)) void alloc_slab() {
+    __attribute__((noinline)) void alloc_slab(size_t min_bytes = 0) {
         constexpr size_t kHuge = size_t(2) << 20;
-        const size_t slab_bytes = next_slab_bytes_;
+        size_t slab_bytes = next_slab_bytes_;
         if (next_slab_bytes_ < (size_t(16) << 20)) next_slab_bytes_ <<= 1;
+        if (min_bytes > slab_bytes) {
+            slab_bytes = (min_bytes + kHuge - 1) & ~(kHuge - 1);
+        }
 
         const size_t map_sz = slab_bytes + kHuge;
         void* raw = ::mmap(nullptr, map_sz, PROT_READ | PROT_WRITE,
@@ -265,78 +301,7 @@ class ThreadBlockArena {
     char* slab_cur_ = nullptr;
     char* slab_end_ = nullptr;
     size_t next_slab_bytes_ = size_t(4) << 20;
-};
-
-// Per-thread THP bump allocator for cross-barrier C1->C2 linked shard slabs (zero 4-KB page faults).
-class HugeBumpArena {
-   public:
-    HugeBumpArena() = default;
-    HugeBumpArena(const HugeBumpArena&) = delete;
-    HugeBumpArena& operator=(const HugeBumpArena&) = delete;
-    HugeBumpArena(HugeBumpArena&& o) noexcept
-        : slabs_(std::move(o.slabs_)), cur_(o.cur_), end_(o.end_) {
-        o.cur_ = nullptr;
-        o.end_ = nullptr;
-    }
-    HugeBumpArena& operator=(HugeBumpArena&& o) noexcept {
-        if (this != &o) {
-            release_all();
-            slabs_ = std::move(o.slabs_);
-            cur_ = o.cur_;
-            end_ = o.end_;
-            o.cur_ = nullptr;
-            o.end_ = nullptr;
-        }
-        return *this;
-    }
-    ~HugeBumpArena() { release_all(); }
-
-    template <typename T>
-    T* alloc(size_t count) {
-        if (count == 0) return nullptr;
-        const size_t bytes = ((count * sizeof(T)) + 63u) & ~size_t(63u);
-        if (__builtin_expect(static_cast<size_t>(end_ - cur_) < bytes, 0)) {
-            alloc_slab(bytes);
-        }
-        T* p = reinterpret_cast<T*>(cur_);
-        cur_ += bytes;
-        return p;
-    }
-
-    void release_all() noexcept {
-        for (const auto& s : slabs_) ::munmap(s.ptr, s.bytes);
-        std::vector<Slab>().swap(slabs_);
-        cur_ = nullptr;
-        end_ = nullptr;
-    }
-
-   private:
-    struct Slab {
-        void* ptr;
-        size_t bytes;
-    };
-
-    __attribute__((noinline)) void alloc_slab(size_t min_bytes) {
-        constexpr size_t kHuge = size_t(2) << 20;
-        const size_t slab_bytes = std::max<size_t>(size_t(8) << 20, (min_bytes + kHuge - 1) & ~(kHuge - 1));
-        const size_t map_sz = slab_bytes + kHuge;
-        void* raw = ::mmap(nullptr, map_sz, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (raw == MAP_FAILED) throw std::bad_alloc();
-        const uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
-        const uintptr_t aligned = (addr + kHuge - 1) & ~(uintptr_t(kHuge) - 1);
-        if (aligned > addr) ::munmap(raw, aligned - addr);
-        const size_t tail = (addr + map_sz) - (aligned + slab_bytes);
-        if (tail > 0) ::munmap(reinterpret_cast<void*>(aligned + slab_bytes), tail);
-        ::madvise(reinterpret_cast<void*>(aligned), slab_bytes, MADV_HUGEPAGE);
-        slabs_.push_back(Slab{reinterpret_cast<void*>(aligned), slab_bytes});
-        cur_ = reinterpret_cast<char*>(aligned);
-        end_ = cur_ + slab_bytes;
-    }
-
-    std::vector<Slab> slabs_;
-    char* cur_ = nullptr;
-    char* end_ = nullptr;
+    size_t bump_slab_idx_ = 0;
 };
 
 template <typename T>

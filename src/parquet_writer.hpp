@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <immintrin.h>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -262,37 +263,37 @@ inline void encode_def_levels_bit1(Buf& out, const uint8_t* defs, size_t n) {
     out.le32(0);
     const size_t start_pos = out.size();
 
+    // Fast AVX2 bit-packed encoding: 60 bytes (480 values = 15 x 32-byte AVX2 vectors) per group!
+    const __m256i v_one = _mm256_set1_epi8(1);
     size_t i = 0;
-    while (i < n) {
-        const uint8_t v = defs[i] & 1u;
-        size_t run = 1;
-        while (i + run < n && (defs[i + run] & 1u) == v) ++run;
-        if (run >= 8) {
-            out.varint(run << 1);
-            out.u8(v);
-            i += run;
-        } else {
-            size_t bp_end = i + 8;
-            while (bp_end < n && (bp_end - i) < 63 * 8) {
-                const uint8_t nv = defs[bp_end] & 1u;
-                size_t nrun = 1;
-                while (bp_end + nrun < n && nrun < 8 && (defs[bp_end + nrun] & 1u) == nv) ++nrun;
-                if (nrun >= 8) break;
-                bp_end += 8;
+    const size_t max_out = start_pos + (n + 7) / 8 + (n / 480) + 16;
+    out.data.reserve(max_out);
+
+    while (i + 480 <= n) {
+        out.u8(static_cast<uint8_t>((60u << 1) | 1u));
+        const size_t old = out.data.size();
+        out.data.resize(old + 60);
+        uint8_t* dst = out.data.data() + old;
+        for (size_t g = 0; g < 15; ++g) {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(defs + i + g * 32));
+            const uint32_t m = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_one)));
+            std::memcpy(dst + g * 4, &m, 4);
+        }
+        i += 480;
+    }
+
+    if (i < n) {
+        const size_t rem = n - i;
+        const size_t groups = (rem + 7) / 8;  // <= 60
+        out.u8(static_cast<uint8_t>((groups << 1) | 1u));
+        for (size_t g = 0; g < groups; ++g) {
+            uint8_t byte = 0;
+            const size_t base = i + g * 8;
+            const size_t lim = std::min<size_t>(8, n - base);
+            for (size_t b = 0; b < lim; ++b) {
+                byte |= static_cast<uint8_t>((defs[base + b] & 1u) << b);
             }
-            if (bp_end > n) bp_end = n;
-            const size_t groups = (bp_end - i + 7) / 8;
-            out.u8(static_cast<uint8_t>((groups << 1) | 1));
-            for (size_t g = 0; g < groups; ++g) {
-                uint8_t byte = 0;
-                const size_t base = i + g * 8;
-                const size_t lim = std::min<size_t>(8, n - base);
-                for (size_t b = 0; b < lim; ++b) {
-                    byte |= static_cast<uint8_t>((defs[base + b] & 1u) << b);
-                }
-                out.u8(byte);
-            }
-            i += groups * 8;
+            out.u8(byte);
         }
     }
 
@@ -421,12 +422,12 @@ inline void write_footer(RawFile& file, const ColDef* schema, size_t ncols,
 
 class UserDailyParquetWriter {
    public:
-    static constexpr int64_t kRowGroupRows = 131072;
+    static constexpr int64_t kRowGroupRows = 65536;
 
     explicit UserDailyParquetWriter(const std::string& path)
         : file_(path),
-          col_user_(2 << 20),
-          vals_top_cat_(512 << 10),
+          col_user_(1 << 20),
+          vals_top_cat_(256 << 10),
           col_day_(std::make_unique_for_overwrite<int32_t[]>(kRowGroupRows)),
           col_sessions_(std::make_unique_for_overwrite<int32_t[]>(kRowGroupRows)),
           col_events_(std::make_unique_for_overwrite<int32_t[]>(kRowGroupRows)),

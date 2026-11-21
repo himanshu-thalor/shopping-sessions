@@ -33,7 +33,7 @@ class LinkTable {
         struct Entry {
             UserId key;
             uint32_t local;
-            uint32_t pad;
+            uint32_t count;
         };
         static_assert(sizeof(Entry) == 16);
 
@@ -57,32 +57,32 @@ class LinkTable {
             table.swap(bigger);
         }
 
-        [[gnu::noinline]] uint32_t intern_grow(UserId key, uint64_t hash,
-                                               const OverflowArena* const* arenas) {
+        [[gnu::noinline]] Entry& intern_grow(UserId key, uint64_t hash,
+                                             const OverflowArena* const* arenas) {
             reserve(std::max<size_t>(64, table.size() * 2), arenas);
             const size_t mask = table.size() - 1;
             size_t i = static_cast<size_t>(hash) & mask;
             for (;;) {
                 Entry& e = table[i];
-                if (UserId::equals(e.key, key, arenas)) return e.local;
+                if (UserId::equals(e.key, key, arenas)) return e;
                 if (e.key.empty()) {
                     const uint32_t n = static_cast<uint32_t>(names.size());
                     e = Entry{key, n, 0};
                     names.push_back(key);
-                    return n;
+                    return e;
                 }
                 i = (i + 1) & mask;
             }
         }
 
-        [[gnu::always_inline]] inline uint32_t intern_local(UserId key, uint64_t hash,
-                                                            const OverflowArena* const* arenas) {
+        [[gnu::always_inline]] inline Entry& intern(UserId key, uint64_t hash,
+                                                    const OverflowArena* const* arenas) {
             if (__builtin_expect(table.empty(), 0)) return intern_grow(key, hash, arenas);
             const size_t mask = table.size() - 1;
             size_t i = static_cast<size_t>(hash) & mask;
             for (;;) {
                 Entry& e = table[i];
-                if (__builtin_expect(UserId::equals(e.key, key, arenas), 1)) return e.local;
+                if (__builtin_expect(UserId::equals(e.key, key, arenas), 1)) return e;
                 if (e.key.empty()) {
                     if (__builtin_expect((names.size() + 1) * 10 >= table.size() * 7, 0)) {
                         return intern_grow(key, hash, arenas);
@@ -90,21 +90,21 @@ class LinkTable {
                     const uint32_t n = static_cast<uint32_t>(names.size());
                     e = Entry{key, n, 0};
                     names.push_back(key);
-                    return n;
+                    return e;
                 }
                 i = (i + 1) & mask;
             }
         }
 
-        [[gnu::always_inline]] inline uint32_t find_local(
-            UserId key, uint64_t hash, const OverflowArena* const* arenas) const noexcept {
-            if (__builtin_expect(table.empty(), 0)) return kNone;
+        [[gnu::always_inline]] inline Entry* find_existing(
+            UserId key, uint64_t hash, const OverflowArena* const* arenas) noexcept {
+            if (__builtin_expect(table.empty(), 0)) return nullptr;
             const size_t mask = table.size() - 1;
             size_t i = static_cast<size_t>(hash) & mask;
             for (;;) {
-                const Entry& e = table[i];
-                if (__builtin_expect(UserId::equals(e.key, key, arenas), 1)) return e.local;
-                if (e.key.empty()) return kNone;
+                Entry& e = table[i];
+                if (__builtin_expect(UserId::equals(e.key, key, arenas), 1)) return &e;
+                if (e.key.empty()) return nullptr;
                 i = (i + 1) & mask;
             }
         }
@@ -317,7 +317,7 @@ class LinkTable {
                                 __builtin_prefetch(&part.table[ptr[i + 8].hash & mask], 1, 1);
                             }
                             const Endpoint& ep = ptr[i];
-                            const uint32_t loc = part.intern_local(ep.key, ep.hash, arenas);
+                            const uint32_t loc = part.intern(ep.key, ep.hash, arenas).local;
                             mask = part.table.size() - 1;
                             tmp_ep_loc.push_back(EpLoc{ep_base + ep.local_ep, loc});
                         }
@@ -359,7 +359,7 @@ class LinkTable {
             return;
         }
 
-        // Stage 3: Flat zero-atomic Union-Find by rank with path halving.
+        // Stage 3: Flat zero-atomic Union-Find (16-ahead software prefetched!).
         const uint32_t N = total_linked_;
         auto parent = std::make_unique_for_overwrite<uint32_t[]>(N);
         auto rank = std::make_unique<uint8_t[]>(N);
@@ -376,6 +376,10 @@ class LinkTable {
         const uint32_t* ep_ptr = edges_.get();
         const size_t nedges = total_eps_;
         for (size_t i = 0; i < nedges; i += 2) {
+            if (i + 32 < nedges) {
+                __builtin_prefetch(&parent[ep_ptr[i + 32]], 1, 1);
+                __builtin_prefetch(&parent[ep_ptr[i + 33]], 1, 1);
+            }
             uint32_t ra = find(ep_ptr[i]);
             uint32_t rb = find(ep_ptr[i + 1]);
             if (ra == rb) continue;
@@ -399,6 +403,11 @@ class LinkTable {
         auto min_node = std::make_unique_for_overwrite<uint32_t[]>(N);
         for (uint32_t i = 0; i < N; ++i) min_node[i] = i;
         for (uint32_t i = 0; i < N; ++i) {
+            if (i + 16 < N) {
+                const uint32_t pr = parent[i + 16];
+                __builtin_prefetch(&parent[pr], 0, 1);
+                __builtin_prefetch(&min_node[pr], 1, 1);
+            }
             uint32_t r = i;
             while (parent[r] != r) r = parent[r];
             parent[i] = r;
@@ -413,6 +422,9 @@ class LinkTable {
         std::memset(next_alias_.get(), 0xFF, N * sizeof(uint32_t));
         linked_roots_.reserve(N / 2);
         for (uint32_t i = 0; i < N; ++i) {
+            if (i + 16 < N) {
+                __builtin_prefetch(&min_node[parent[i + 16]], 0, 1);
+            }
             const uint32_t c = min_node[parent[i]];
             if (c == i) {
                 linked_roots_.push_back(LinkedRoot{all_names[i], i, 0});
